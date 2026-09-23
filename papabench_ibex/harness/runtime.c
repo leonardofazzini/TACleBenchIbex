@@ -8,6 +8,9 @@
 
 #include <stddef.h>
 
+#include "papabench_harness.h"
+#include "ibex_io.h"
+
 /* Declared in include/arch/sfr_defs.h */
 volatile unsigned char papabench_sfr[ 0x100 ] __attribute__( ( aligned( 4 ) ) );
 
@@ -15,8 +18,19 @@ volatile unsigned char papabench_sfr[ 0x100 ] __attribute__( ( aligned( 4 ) ) );
 volatile unsigned char papabench_tick_pending;
 
 
+/*
+  Called by timer_periodic() on every main-loop iteration of both programs,
+  never inside a task: it is also the idle synchronisation point of the
+  peripheral models (periph.h), run with interrupts disabled because the
+  model interrupts share their state.
+*/
 unsigned char papabench_tick_take( void )
 {
+  unsigned int mstatus = ibex_irq_save();
+
+  papabench_periph_poll();
+  ibex_irq_restore( mstatus );
+
   /* A tick arriving between the test and the clear is merged with the one
      being consumed, as on the AVR flag */
   if ( !papabench_tick_pending )

@@ -47,4 +47,34 @@ void papabench_calib( void );
 /* Tick flag, defined in runtime.c */
 extern volatile unsigned char papabench_tick_pending;
 
+/* Scheduler tick period in cycles (harness.c, PAPABENCH_TICK_CYCLES) */
+extern const unsigned int papabench_tick_cycles;
+
+/*
+  Peripheral models (harness/periph.c + harness/<prog>_periph.c, see
+  periph.h). The program's model lists the upstream ISRs it calls; each call
+  goes through papabench_isr_run(), which times it under that index.
+*/
+struct papabench_isr {
+  const char *name;
+};
+
+extern const struct papabench_isr papabench_isrs[];
+extern const unsigned int papabench_nisrs;
+
+/* harness.c: runs fn (an upstream __vector_N) and records its duration */
+void papabench_isr_run( unsigned int id, papabench_fn_t fn );
+
+/* Program model: set up the real peripherals, before the upstream main() */
+void papabench_periph_init( void );
+/* Program model: synchronisation point, called with interrupts disabled */
+void papabench_periph_poll( void );
+
+/* Interrupt dispatch, called by the harness wrappers of the Ibex IRQs */
+void papabench_irq_timer_a( void );
+void papabench_irq_timer_b( void );
+void papabench_irq_timer_c( void );
+void papabench_irq_uart( void );
+void papabench_irq_gpio( void );
+
 #endif /* PAPABENCH_HARNESS_H */

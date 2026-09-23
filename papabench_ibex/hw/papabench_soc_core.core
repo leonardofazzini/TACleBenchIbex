@@ -1,0 +1,32 @@
+CAPI=2:
+# PapaBench-on-Ibex copy of riscv:soc:reference_system_core (Secure-Ibex).
+#
+# Same file list and dependencies as Secure-Ibex/reference_system_core.core,
+# but the RTL comes from the staging directory build/sim/hw/, where 'make sim'
+# copies the Secure-Ibex sources and applies hw/patches/*.patch. This file is
+# copied there too, so every path below is relative to that directory.
+# Verilator only: the FPGA debug-module variant is not needed.
+name: "papabench:soc:reference_system_core"
+description: "Secure-Ibex reference-system SoC with the PapaBench hardware patches"
+filesets:
+  files_rtl_reference_system:
+    files:
+      - rtl/system/reference_system_core.sv
+      - rtl/system/debounce.sv
+      - rtl/system/gpio.sv
+      - rtl/system/pwm.sv
+      - rtl/system/pwm_wrapper.sv
+      - rtl/system/uart.sv
+      - rtl/system/spi_host.sv
+      - rtl/system/spi_top.sv
+    file_type: systemVerilogSource
+
+  files_dbg_sim:
+    depend:
+      - pulp:riscv:debug_module_sim
+
+targets:
+  default:
+    filesets:
+      - files_rtl_reference_system
+      - files_dbg_sim

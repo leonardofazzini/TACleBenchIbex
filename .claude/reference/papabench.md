@@ -39,6 +39,32 @@ Autopilot (`main()` in `mainloop.c` → `periodic_task()` in `main.c` when `time
 
 Interrupt service routines are written as `SIGNAL( SIG_… )` and are **plain C functions** on non-AVR targets (`signal.h`); nothing calls them unless the harness does.
 
+## Interrupts and peripherals (verified 2026-09-23)
+
+| Program | Vector | Source | What it does |
+|---|---|---|---|
+| FBW | `__vector_5` | Timer1 input capture (PPM, falling edge) | decodes the radio: `ICR1` widths, sync gap measured with `TCNT2` (> 7 ms); after 9 channels sets `ppm_valid` |
+| FBW | `__vector_6` | Timer1 compare A | 4017 servo driver: `OCR1A += servo_widths[ servo++ ]` (10 channels, `servo_widths` and `servo` static) |
+| FBW | `__vector_10` | SPI (slave) | one byte of the 23-byte frame with the Autopilot (`FRAME_LENGTH` = 22-byte `inter_mcu_msg` + XOR checksum); writes the next TX byte to `SPDR`, then reads the received one |
+| FBW | `__vector_13` | UART TX complete | sends the next buffered byte (only the boot string: `servo_transmit` is never called) |
+| FBW | `__vector_14` | ADC | stores `ADCW` of `ADMUX & 7`, next channel, restarts (`ADSC`) |
+| Autopilot | `__vector_5` | INT4 (`CTL_BRD_V1_2_1`), modem clock | bit-bangs the downlink on PORTD.6 (start, 8 data, stop); disables INT4 when the buffer is empty |
+| Autopilot | `__vector_12` | Timer1 compare A | `link_fbw`: next SPI byte (write `SPDR`, read the received one); at the end unselects the slave, `SPI_STOP()`, sets `link_fbw_receive_complete` |
+| Autopilot | `__vector_17` | SPI (master) | `link_fbw_on_spi_it()`: `OCR1A = TCNT1 + 200`, enables OCIE1A |
+| Autopilot | `__vector_21` | ADC | as FBW; IR sensors on channels 1 and 2 |
+| Autopilot | `__vector_30` | UART1 RX | `parse_ubx( UDR1 )` |
+
+`PapaBench_for_wcet.txt` lists only I1–I7 (FBW 5/6/10, Autopilot 5/12/17/30), not the ADC and UART TX handlers.
+
+- **`SPDR` is two registers** (write = transmit, read = received byte); both SPI protocols write the next byte and then read the received one in the same ISR, so a single memory cell breaks them (checksums never match).
+- Counters: `TCNT1` is read only by `link_fbw_on_spi_it()`, `TCNT2` and `ICR1` only by the PPM ISR; `timer_now()` is never called.
+- Downlink goes through the modem (`downlink.h` includes `modem.h`, `MODEM_PUT_*` into `tx_buf`), not through a UART. `MODEM_CHECK_RUNNING()` enables INT4 and clears `EIFR.INTF0` (not INTF4).
+- **`ck_a`/`ck_b` are shared by the modem (downlink checksum) and the UBX parser** (both define them; `-fcommon` merges them): a downlink message built while a UBX message is being received corrupts its checksum and the message is dropped. Kept as is.
+- `parse_ubx()` drops a message if `gps_msg_received` is still set (`gps_nb_ovrn++`); `send_gps_pos()` clears it. During the Autopilot's 30-tick start-up wait the main loop does not consume GPS messages.
+- Flight plan (`flight_plan.h`, block 0 "init"): waits for `estimator_flight_time > 8` (seconds of flight after `send_takeOff()`), then climbs to `SECURITY_ALT`; only block 1 sets `VERTICAL_MODE_AUTO_ALT`, so `altitude_control_task` takes its long path (`altitude_pid_run()`) only after ~8 s of flight in AUTO2.
+- Radio: PPM order = channel index (`radio.h`: 0 throttle, 1 roll, 2 pitch, 3 yaw, 4 mode, 5 gain1, 6 gain2, 7 LLS, 8 calib); FBW mode = AUTO when the mode channel ≥ `MIN_PPRZ / 2`; Autopilot `PPRZ_MODE_OF_PULSE`: > 3200 AUTO2, > −4800 AUTO1, else MANUAL; takeoff needs throttle > 0.9 `MAX_PPRZ`.
+- FBW `test_ppm_task` counts `time_since_last_ppm` per main-loop iteration (~300 per tick), not per tick: without PPM the radio is "really lost" within the first tick and FBW goes AUTO.
+
 ## Build macros
 
 - `PAPABENCH_SINGLE` — merges FBW into the Autopilot executable. **Never define it here.**

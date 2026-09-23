@@ -1,0 +1,79 @@
+CAPI=2:
+# PapaBench-on-Ibex copy of the sim_ibex target of riscv:soc:reference_system
+# (Secure-Ibex/reference_system.core): standard Ibex + the patched SoC
+# (papabench:soc:reference_system_core) + the Verilator testbench.
+#
+# Copied by 'make sim' into build/sim/hw/ next to the staged, patched RTL;
+# paths are relative to that directory. The top module keeps the name
+# 'reference_system' because the testbench C++ code looks it up by name.
+name: "papabench:soc:reference_system"
+description: "Standard-Ibex reference system with the PapaBench hardware patches (Verilator)"
+
+filesets:
+  files_rtl:
+    depend:
+      - papabench:soc:reference_system_core
+      - lowrisc:ibex:ibex_top
+
+  files_verilator:
+    depend:
+      - lowrisc:ibex:sim_shared
+      - lowrisc:dv_verilator:memutil_verilator
+      - lowrisc:dv_verilator:simutil_verilator
+      - lowrisc:dv_verilator:ibex_pcounts
+    files:
+      - dv/verilator/reference_system.cc: { file_type: cppSource }
+      - dv/verilator/reference_system.h:  { file_type: cppSource, is_include_file: true}
+      - dv/verilator/reference_system_main.cc: { file_type: cppSource }
+      - dv/verilator/reference_system_verilator_lint.vlt:  { file_type: vlt }
+
+  files_simulation:
+    depend:
+      - lowrisc:dv_dpi_sv:dmidpi
+      - lowrisc:dv_dpi_c:dmidpi
+      - lowrisc:dv_dpi_sv:uartdpi
+      - lowrisc:dv_dpi_c:uartdpi
+    files:
+      # Deterministic environment (hw/rtl/) and its generated stimulus
+      # tables (hw/stimulus/gen_stimulus.py), staged by 'make sim'
+      - rtl/papabench/papabench_stim.svh: { is_include_file: true }
+      - rtl/papabench/papabench_env.sv
+      - rtl/top_simulation/reference_system.sv
+    file_type: systemVerilogSource
+
+parameters:
+  PRIM_DEFAULT_IMPL:
+    datatype: str
+    paramtype: vlogdefine
+    description: Primitives implementation to use, e.g. "prim_pkg::ImplGeneric".
+
+targets:
+  default: &default_target
+    filesets:
+      - files_rtl
+
+  # Same tool options as Secure-Ibex sim_ibex
+  sim_ibex:
+    <<: *default_target
+    default_tool: verilator
+    filesets_append:
+      - files_verilator
+      - files_simulation
+    toplevel: reference_system
+    tools:
+      verilator:
+        mode: cc
+        verilator_options:
+          - '--trace'
+          - '--trace-fst' # this requires -DVM_TRACE_FMT_FST in CFLAGS below!
+          - '--trace-structs'
+          - '--trace-params'
+          - '--trace-max-array 1024'
+          - '-CFLAGS "-std=c++11 -Wall -DVM_TRACE_FMT_FST -DTOPLEVEL_NAME=reference_system"'
+          - '-LDFLAGS "-pthread -lutil -lelf"'
+          - "-Wall"
+          - "-Wwarn-IMPERFECTSCH"
+          - "-Wno-fatal"
+          - "--unroll-count 72"
+    parameters:
+      - PRIM_DEFAULT_IMPL=prim_pkg::ImplGeneric

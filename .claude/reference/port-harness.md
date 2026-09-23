@@ -1,6 +1,6 @@
 # PapaBench-on-Ibex port and measurement harness (`papabench_ibex/`)
 
-Status: FBW and Autopilot each run their **own upstream scheduler**, paced by the Ibex machine timer, on Verilator (standard Ibex); `mcycle` is recorded per task activation. Open decisions are in `.claude/status.md` → To-do.
+Status: FBW and Autopilot each run their **own upstream scheduler**, paced by the Ibex machine timer, on Verilator (standard Ibex + our SoC patches); the AVR peripherals are **modelled on real Ibex peripherals and interrupts** (TimerA/B/C, UART, GPIO, PWM) with deterministic stimuli from a simulation environment; `mcycle` is recorded per task activation and per upstream ISR call. Open decisions are in `.claude/status.md` → To-do.
 
 ## Requirements (decided with the user)
 
@@ -10,6 +10,7 @@ Status: FBW and Autopilot each run their **own upstream scheduler**, paced by th
 - Scheduler time base: HW timer `0x80000000` (IRQ 7); tick = AVR Timer2 period (16.384 ms) at 50 MHz = 819200 cycles (2026-09-23).
 - Output: `mcycle` per task, tasks activated by the upstream scheduler (the earlier direct-call table mode was replaced, 2026-09-23).
 - Sources in `bench/` are compiled unmodified; the only source change is a patch applied to a build-dir copy. Loop-bound and entry-point pragmas stay untouched.
+- Real interrupts and peripherals (2026-09-23): upstream ISRs run from real Ibex interrupts; stimuli are deterministic (clock-driven, no host input); servos on the PWM; SoC hardware extended only through patches in `hw/patches/` (TimerC, 20-bit PWM, environment in the sim top).
 
 ## Architecture
 
@@ -17,12 +18,14 @@ Two sides that never include each other's headers (PapaBench `inttypes.h` makes 
 
 | Side | Files | Includes | Flags |
 |---|---|---|---|
-| PapaBench | upstream `.c` (instrumented), `harness/{fbw,autopilot}_glue.c` | `include/` (our `sfr_defs.h`) first, then PapaBench | `PB_CFLAGS` (+ `INSTR_FLAGS` for upstream files) |
+| PapaBench | upstream `.c` (instrumented), `harness/{fbw,autopilot}_glue.c`, `harness/periph.c`, `harness/{fbw,autopilot}_periph.c` | `include/` (our `sfr_defs.h`) first, then PapaBench | `PB_CFLAGS` (+ `INSTR_FLAGS` for upstream files) |
 | Ibex | `harness/harness.c`, `harness/runtime.c`, `harness/calib.c`, Secure-Ibex `common/{reference_system_common,timer,uart}.c`, `hello_test/crt0.S` | Secure-Ibex `common/` | `IBEX_CFLAGS` |
 
-They meet only through `harness/papabench_harness.h` (no fixed-width types): `papabench_tasks[]` (`{ name, first, last }`), `papabench_ntasks`, `papabench_prog_name[]`, `papabench_startup_ticks`, `papabench_check()`, `papabench_upstream_main()`, `papabench_calib()`, `papabench_tick_pending`.
+They meet only through `harness/papabench_harness.h` (no fixed-width types): `papabench_tasks[]` (`{ name, first, last }`), `papabench_ntasks`, `papabench_prog_name[]`, `papabench_startup_ticks`, `papabench_check()`, `papabench_upstream_main()`, `papabench_calib()`, `papabench_tick_pending`, `papabench_tick_cycles`; the model interface `papabench_isrs[]`/`papabench_nisrs`, `papabench_isr_run()`, `papabench_periph_init()`, `papabench_periph_poll()`, `papabench_irq_{timer_a,timer_b,timer_c,uart,gpio}()`. `harness/ibex_io.h` (SoC addresses, CSR helpers, `unsigned int` only) is included by both sides.
 
-Run flow (`harness.c` `main()`): `pcount_enable` → header line → `papabench_check()` → fill stats from the task table → 8 calls to `papabench_calib()` (overhead) → `install_exception_handler( 7, harness_timer_isr )`, `mtimecmp = mtime + TICK_CYCLES`, enable IRQ 7 and `mstatus.MIE` → `papabench_upstream_main()` (never returns). The ISR, after `TICKS + papabench_startup_ticks` ticks, prints the report and calls `sim_halt()`.
+Run flow (`harness.c` `main()`): `pcount_enable` → header line → `papabench_check()` → fill stats from the task table → 8 calls to `papabench_calib()` (hook overhead) and 8 `papabench_isr_run()` of an empty function (`isr_overhead`) → `papabench_periph_init()` (program model: event handlers, PWM, environment mode on `gp_o`) → install wrappers on IRQ 18/19/20/16/17, enable 18/19/20/16 → `install_exception_handler( 7, harness_timer_isr )`, `mtimecmp = mtime + TICK_CYCLES`, enable IRQ 7 and `mstatus.MIE` → `papabench_upstream_main()` (never returns). The tick ISR, after `TICKS + papabench_startup_ticks` ticks, prints the report and calls `sim_halt()`.
+
+Linker script: `papabench_ibex/link.ld` (112 KiB code+data, 16 KiB stack = the whole 128 KiB RAM). The stock `link.ld` (56 KiB) no longer fits the Autopilot (58 KB text).
 
 ## Time base: Ibex timer → AVR Timer2 overflow
 
@@ -44,6 +47,34 @@ Run flow (`harness.c` `main()`): `pcount_enable` → header line → `papabench_
 - `calib.c` is compiled with the same instrumentation; its minimum over 8 calls is printed as `overhead` (23 cycles at `-Os`) and is **included** in every sample.
 - Composite Autopilot tasks: `navigation_task` = `estimator_propagate_state` … `course_run`, `reporting_task` = `send_boot` … `send_nav_ref`, `receive_gps_data_task` = `parse_gps_msg` … `send_takeOff`; the calls in between are not instrumented and are part of the sample.
 
+## Peripheral models (`harness/periph.h`, `periph.c`, `{fbw,autopilot}_periph.c`)
+
+The upstream code only touches `papabench_sfr[]`. A per-program model reads what it wrote there and drives the real SoC; AVR interrupt sources become Ibex interrupts; the upstream `SIGNAL()` handlers (`__vector_N`, plain C functions) are called from the Ibex handlers through `papabench_isr_run( id, fn )` (timed per ISR, `isr,...` lines).
+
+| AVR source | FBW (`__vector_N`) | Autopilot (`__vector_N`) | Ibex resource |
+|---|---|---|---|
+| Timer2 overflow (tick) | — (polled) | — (polled) | machine timer, IRQ 7 (unchanged) |
+| Timer1 compare A | servo, 6 | `link_fbw` byte pacing, 12 | TimerA ch 0, IRQ 18 |
+| ADC conversion complete | 14 | 21 | TimerB ch 0, IRQ 19 (13×128 AVR clocks = 5200 cycles) |
+| SPI transfer complete | slave, 10 | master, 17 | TimerC ch 0, IRQ 20 |
+| UART TX complete | 13 (boot string) | — (unused) | TimerC ch 2 + real UART TX (`uart0.log`) |
+| Timer1 input capture (radio PPM) | 5 | — | env → `gp_i[0]`, IRQ 17 |
+| INT4 (modem clock) | — | 5 | env → `gp_i[0]`, IRQ 17; data bit PORTD.6 → `gp_o[3]` |
+| UART1 RX (GPS) | — | 30 | env → `uart_rx` → real UART RX FIFO, IRQ 16 |
+| Servo outputs (4017) | PWM ch 0–9 (width just added to OCR1A, 20 ms period), `gp_o[4]` clock, `gp_o[5]` reset | — | PWM |
+
+- **Event channels**: each of TimerA/B/C carries up to `PB_MAX_CH` one-shot channels; the compare is the earliest armed one; its IRQ runs every due channel in channel order, then reprograms (writing `mtimecmp` clears the sticky IRQ). TimerA's `mtime` is the time base of all models (`pb_now()`).
+- **Time**: AVR clock = 16 MHz (`CLOCK`), Ibex = 50 MHz: `avr = ibex * 8 / 25` (`pb_avr_of_ibex()`, 32-bit hardware division while mtime < 2^32), `PB_IBEX_OF_AVR()` rounds up.
+- **Synchronisation points** (all deterministic): after every wrapper (`papabench_periph_poll()` at the end of each harness IRQ wrapper) and in the idle loop (`papabench_tick_take()`, called by `timer_periodic()` on every main-loop iteration of both programs, with `mstatus.MIE` cleared). A poll detects what the software wrote: `TIMSK.OCIE1A` + `OCR1A` → (re)arm TimerA; `ADCSR`'s ADEN+ADIE+ADSC → arm a conversion; `UCSRB.TXCIE` with the transmitter idle → a byte was written to `UDR` (push to the real UART, arm TX-complete); SPI master start (below); `TIMSK.TICIE1` (FBW) / `EIMSK.INT4` (Autopilot) → enable/disable IRQ 17.
+- **Counters read by ISRs** (`TCNT1`, `TCNT2`, `ICR1`): only read inside ISRs (`timer_now()` is never called), so they are written just before each upstream ISR (`pb_avr_snapshot()`). `pb_oc_sync()` measures an `OCR1A` written by that ISR **from the snapshot**, not from the time of the poll: the model's own cycles are not AVR time. (Measuring from "now" broke `link_fbw`'s `OCR1A = TCNT1 + 200`: ~263 AVR clocks of model work had passed, the compare fell a full 16-bit wrap later, each SPI byte took 4 ms.)
+- **`SPDR` double register**: see `sfr_defs.h`; every access returns a fresh slot preloaded with `papabench_spdr_rx`, so write-then-read ISRs get the received byte. The access counter `papabench_spdr_accesses` tells the Autopilot model that the software wrote a byte: a master transfer (8 bits × SPCR divider) starts at the first sync point after an SPDR access while SPE+MSTR are set. After `SIG_SPI` the software does not touch SPDR, so no spurious start; `SPI_STOP()` clears SPE, which ends the frame. SPIF is set on completion and cleared after the vector runs.
+- **Virtual other MCU**: FBW's model plays the Autopilot master (`fbw_spi_frame()`: one frame every 3 ticks = `link_fbw_send()` rate; SS on PINB2 low during the frame; bytes spaced by SPI byte + 200 AVR clocks); the Autopilot's model plays the FBW slave (`ap_spi_frame()`: radio OK + averaged channels, mode stick MANUAL frames 0–1, AUTO1 2–3, AUTO2 from 4, full throttle). Frames carry the upstream XOR checksum; both sides accept them (`check_mega128_values_task` / `radio_control_task` long paths).
+- **ADC samples**: FBW ch 3 = 629 (11.1 V), ch 6 = 281 (5 V); Autopilot IR1/IR2 = level attitude (402/512) + a ±20-count 2 s roll triangle.
+
+### Simulation environment (`hw/rtl/papabench_env.sv`, patch 0003)
+
+Instantiated in the Verilator top; drives `gp_i` and `uart_rx` from the clock and from `papabench_stim.svh` (generated at `make sim` by `hw/stimulus/gen_stimulus.py`). The program selects it with `gp_o[2:1]` (`papabench_periph_init()`: 1 FBW, 2 Autopilot). `gp_i[0]` is an edge latch (the core IRQ input is level-sensitive and the GPIO has no interrupt register), cleared by toggling `gp_o[0]` (`pb_gpio_ack()`, first thing in the IRQ 17 handler). FBW: PPM, 40 frames of 9 channels (25 ms frames, sync ≥ 8 ms, mode MANUAL then AUTO), cyclic. Autopilot: modem clock 4800 Hz; GPS epochs every 250 ms from 250 ms (120 epochs = 30 s, NAV-POSUTM + NAV-STATUS + NAV-VELNED, 94 bytes at 115200 baud, circle of 80 m at 15 m/s, 200 m, 3D fix). Changing the stimulus requires `make sim`.
+
 ## Upstream compile problems (unchanged from the first port)
 
 - `autopilot/main.c`: `ModeUpdate(...); else` → `patches/autopilot_main_modeupdate.patch`, applied to `build/autopilot/patched/main.c`.
@@ -55,11 +86,17 @@ Run flow (`harness.c` `main()`): `pcount_enable` → header line → `papabench_
 
 - Nothing under `bench/` or `Secure-Ibex/` is written; all outputs go to `papabench_ibex/build/<prog>/`.
 - Every PapaBench function that is not a task boundary must be excluded from instrumentation, otherwise its hooks add cycles inside task samples. The generated lists enforce this; do not hand-edit `exclude.txt`.
-- Samples are raw: they include `overhead`. A sample during which the tick fired also contains the ISR entry/exit cost (register save/restore, `mret`), which is not subtracted — this is why short FBW tasks show max ≈ min + ~90.
+- Samples are raw: they include `overhead`. Every harness interrupt wrapper body (tick, TimerA/B/C, UART, GPIO: model work + upstream ISR + poll) is added to `harness_isr_cycles` and subtracted; the trap entry/exit (register save/restore, `mret`) is not. With the ADC firing every 5200 cycles this now touches many samples, raising `max`.
+- ISR samples (`isr,...`) time only the upstream `__vector_N` call (plus `isr_overhead`, printed); ISRs never nest.
+- Upstream code calling `papabench_spdr_access()` (every SPDR access) pays that call inside its own sample (e.g. `link_fbw_send`).
 - `libgcc.a` in the only available toolchain is rv32imc: soft-float helpers execute compressed instructions (open decision).
-- Size: the Autopilot uses ~54.7 KB of the 56 KiB `ram` region of the stock `link.ld` (~2.6 KB left).
+- Size: `papabench_ibex/link.ld` gives 112 KiB; FBW ~18.5 KB text, Autopilot ~58 KB text (the stock 56 KiB `link.ld` is too small since the models).
 
 ## Traps
+
+- A model that computes a compare from "now" after an ISR instead of from the counter snapshot the ISR read loses AVR time to model overhead (see Peripheral models).
+- The idle poll runs inside `timer_periodic()`: a program that stops calling it (e.g. a long upstream loop outside the scheduler) also stops the models' idle synchronisation; interrupts still sync.
+- `gp_o` belongs to the models (`pb_gpo_write/toggle`): writing the GPIO elsewhere would change the environment mode or acknowledge the latch.
 
 - Adding a Secure-Ibex header to a glue file, or a PapaBench header to `harness.c`/`runtime.c`/`calib.c`, breaks the build with conflicting `uint32_t` typedefs.
 - A glue task entry split over several lines, or not in the `PAPABENCH_TASK( "name", first, last ),` form, is invisible to the Makefile: the table still compiles but the function gets no hooks and the task reports count 0.

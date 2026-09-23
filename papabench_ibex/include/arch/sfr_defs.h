@@ -13,6 +13,14 @@
   timer_periodic() relies on. The Makefile passes PAPABENCH_TIFR_ADDR (data
   address of TIFR for the device) and PAPABENCH_TICK_BIT (TOV2).
 
+  One register is not one memory cell: SPDR, the SPI data register, is a
+  transmit register for writes and a receive buffer for reads. The ISRs write
+  the next byte to send and then read the byte received, so a single RAM cell
+  would hand them back their own byte. Every access to the address
+  PAPABENCH_SPDR_ADDR (from the Makefile, 0x2F on both devices) therefore
+  calls papabench_spdr_access() (harness/periph.c), which returns a fresh slot
+  holding the last received byte. The address test folds at compile time.
+
   Only the macros used by PapaBench are provided. _SFR_ASM_COMPAT and
   __SFR_OFFSET are not supported.
 */
@@ -26,9 +34,17 @@
 
 extern volatile uint8_t papabench_sfr[ PAPABENCH_SFR_SIZE ];
 
-/* AVR data-space address -> harness RAM */
+#if !defined( PAPABENCH_SPDR_ADDR )
+#error "PAPABENCH_SPDR_ADDR must be defined"
+#endif
+
+volatile unsigned char *papabench_spdr_access( void );
+
+/* AVR data-space address -> harness RAM (SPDR -> receive/transmit slots) */
 #define _MMIO_BYTE( mem_addr ) \
-  ( *( volatile uint8_t * )( &papabench_sfr[ ( mem_addr ) ] ) )
+  ( *( volatile uint8_t * )( ( mem_addr ) == PAPABENCH_SPDR_ADDR ? \
+                             papabench_spdr_access() : \
+                             &papabench_sfr[ ( mem_addr ) ] ) )
 #define _MMIO_WORD( mem_addr ) \
   ( *( volatile uint16_t * )( &papabench_sfr[ ( mem_addr ) ] ) )
 
