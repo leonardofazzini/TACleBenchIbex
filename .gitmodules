@@ -1,0 +1,3 @@
+[submodule "Secure-Ibex"]
+	path = Secure-Ibex
+	url = git@github.com:leonardofazzini/Secure-Ibex.git
