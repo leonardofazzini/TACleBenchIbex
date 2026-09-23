@@ -1,0 +1,11 @@
+--- a/main.c
++++ b/main.c
+@@ -145,7 +145,7 @@
+   /** We remain in home mode until explicit reset from the RC */
+   if ( pprz_mode != PPRZ_MODE_HOME || CheckEvent( rc_event_1 ) )
+     ModeUpdate( pprz_mode, PPRZ_MODE_OF_PULSE( from_fbw.channels[ RADIO_MODE ],
+-                from_fbw.status ) );
++                from_fbw.status ) )
+ 
+   else
+     return FALSE;

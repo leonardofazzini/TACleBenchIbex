@@ -24,7 +24,7 @@ Run TACLeBench on our own Ibex SoC (the `Secure-Ibex` reference system, **standa
 - **Upstream:** TACLeBench (WCET 2016 paper, `doc/20160705-wcet-falk.pdf`); PapaBench task list in `bench/parallel/PapaBench/PapaBench_for_wcet.txt`.
 - **Platform:** `Secure-Ibex/` git submodule (`git@github.com:leonardofazzini/Secure-Ibex.git`), Verilator target `sim_ibex`.
 
-**Hard constraints: `bench/` is upstream TACLeBench and read-only. `Secure-Ibex/` is a submodule with its own `CLAUDE.md` and workflow — do not edit it from this repo. New code (harness, Makefiles, linker scripts, scripts) goes in a new top-level directory.**
+**Hard constraints: `bench/` is upstream TACLeBench and read-only. `Secure-Ibex/` is a submodule with its own `CLAUDE.md` and workflow — do not edit it from this repo (not even build artifacts). New code (harness, Makefiles, linker scripts, scripts, patches) goes in `papabench_ibex/`.**
 
 ---
 
@@ -38,7 +38,7 @@ Run TACLeBench on our own Ibex SoC (the `Secure-Ibex` reference system, **standa
 | Build, run, debug; coding style; step-by-step recipes | [`.claude/reference/conventions.md`](.claude/reference/conventions.md) |
 | Find where a file lives | [`.claude/tree.md`](.claude/tree.md) |
 | Know what is done and what is open | [`.claude/status.md`](.claude/status.md) |
-| Upstream TACLeBench overview and citation (for humans) | [`README.md`](README.md) |
+| How to run PapaBench and what was done (for humans); upstream TACLeBench citation | [`README.md`](README.md) |
 | Add, rename, move or delete a file | update `.claude/tree.md` **first** |
 | Close a step or open a to-do | update `.claude/status.md` **first** |
 
@@ -46,18 +46,21 @@ Run TACLeBench on our own Ibex SoC (the `Secure-Ibex` reference system, **standa
 
 ## 4. Invariants worth knowing before touching anything
 
-- **AVR peripheral registers are plain memory accesses at addresses 0x20–0xFF.** In C, `arch/include/avr/arch/sfr_defs.h` defines `_SFR_IO8(x)` as `_MMIO_BYTE( (x) + 0x20 )` = `*(volatile uint8_t *)(x + 0x20)`, and registers like `TIFR`, `SPDR`, `TCNT1` are used that way. The `+ 0x20` is hard-coded: `__SFR_OFFSET` only matters under `_SFR_ASM_COMPAT`, so the PapaBench `README` advice to set `SFR_OFFSET` does not fix anything. On the Ibex SoC RAM starts at `0x00100000` and nothing is mapped at 0x0–0xFF, so the harness has to redirect `_MMIO_BYTE`/`_MMIO_WORD` to a RAM-backed array. How the bus reacts to the unmapped access is `TODO: verify`.
-- **Time only advances if the harness makes it advance.** `timer_periodic()` (both `sw/airborne/*/timer.h`) polls the `TOV2` bit of `TIFR` and clears it. Nothing sets it on Ibex: the Autopilot `main()` in `mainloop.c` spins forever in its `while ( init_cpt )` wait loop, and in FBW `_20Hz` never reaches 3, so `servo_transmit()` never runs. The harness has to set the flag (or replace the scheduler) to get deterministic task activations.
+- **AVR peripheral registers are plain memory accesses at addresses 0x20–0xFF.** In C, `arch/include/avr/arch/sfr_defs.h` defines `_SFR_IO8(x)` as `_MMIO_BYTE( (x) + 0x20 )` = `*(volatile uint8_t *)(x + 0x20)`, and registers like `TIFR`, `SPDR`, `TCNT1` are used that way. The `+ 0x20` is hard-coded: `__SFR_OFFSET` only matters under `_SFR_ASM_COMPAT`, so the PapaBench `README` advice to set `SFR_OFFSET` does not fix anything. On the Ibex SoC RAM starts at `0x00100000` and nothing is mapped at 0x0–0xFF, so `papabench_ibex/include/arch/sfr_defs.h` shadows the upstream header (it must stay first in `-I`) and redirects `_MMIO_BYTE`/`_MMIO_WORD` into `papabench_sfr[]`. How the bus reacts to an unmapped access is `TODO: verify` (no longer reached).
+- **Each program's own upstream scheduler runs, paced by the Ibex machine timer (`0x80000000`, IRQ 7).** `timer_periodic()` (both `sw/airborne/*/timer.h`) polls `TIFR.TOV2` and "clears" it by writing 1, which on plain RAM would set it. So `harness_timer_isr` sets `papabench_tick_pending` every `TICK_CYCLES` (default 819200 = 16.384 ms at 50 MHz), and our `sfr_defs.h` turns `bit_is_set( TIFR, TOV2 )` into a test-and-clear of that flag. Upstream `main()` is renamed `papabench_upstream_main` and called by the harness.
 - **The two programs are separate by design; never define `PAPABENCH_SINGLE`.** Each has its own `main()` (FBW in `fly_by_wire/main.c`, Autopilot in `autopilot/mainloop.c`) with a `while ( 1 )` loop unless `NO_MAINLOOP` is defined. `PAPABENCH_SINGLE` merges FBW into the Autopilot executable, which is exactly what this project does not want.
-- **The Autopilot needs soft-float, which lives in libgcc.** `pid.c`, `estimator.c`, `nav.c`, `sw/lib/c/math.c` use `float`/`double`; the core has no FPU. Secure-Ibex `common.mk` links with `-nostdlib` and no `-lgcc`, so `__adddf3`-style helpers stay undefined unless the build adds `-lgcc`. libgcc is allowed; libc and heap are not.
+- **Both programs need soft-float, which lives in libgcc — and the only libgcc is rv32imc.** FBW (`servo.c`) and the Autopilot (`pid.c`, `estimator.c`, `nav.c`, `sw/lib/c/math.c`) use `float`/`double`; the core has no FPU, so the build links `-lgcc`. The installed toolchain has a single `rv32imc` multilib, so `__adddf3`, `__muldf3`, `__udivdi3` … execute compressed instructions inside our rv32im binaries. libgcc is allowed; libc and heap are not (`harness/runtime.c` provides `memcpy`/`memset`).
 - **ISA is `rv32im`, not the Secure-Ibex default.** `common.mk` sets `ARCH ?= rv32imc`; this project overrides it with `ARCH=rv32im` (no compressed instructions).
+- **Per-task timing relies on `-finstrument-functions` applied only to task boundaries.** The Makefile builds an exclude list of every other PapaBench function (plain build + `nm`) from the `PAPABENCH_TASK( "name", first, last ),` lines of the glue files; a function with hooks that is not a task boundary adds cycles inside task samples. Samples include the printed `overhead`. Details: `.claude/reference/port-harness.md`.
 - **Loop-bound pragmas and `_Pragma( "entrypoint" )` are sacred.** They are WCET flow facts (`_Pragma( "loopbound min 8 max 8" )` etc., cross-checked in `Loops_Bounds.txt`). Build with `-Wno-unknown-pragmas`; never delete or edit them.
-- **The AVR device macro selects the register header.** `arch/io.h` includes `iom8.h` or `iom128.h` only if `__AVR_ATmega8__` / `__AVR_ATmega128__` is defined; otherwise it just warns and `TIFR` etc. are undefined. FBW includes the headers bare (`<io.h>`, `<signal.h>`), the Autopilot with the `arch/` prefix, so both include paths are needed. Which device goes with which program is `TODO: verify` (expected: FBW → ATmega8, Autopilot → ATmega128).
+- **The AVR device macro selects the register header.** `arch/io.h` includes `iom8.h` or `iom128.h` only if `__AVR_ATmega8__` / `__AVR_ATmega128__` is defined; otherwise it just warns and `TIFR` etc. are undefined. Verified: FBW → ATmega8, Autopilot → ATmega128 (+ `-DUBX`). FBW includes the headers bare (`<io.h>`, `<signal.h>`), the Autopilot with the `arch/` prefix, so both include paths are needed.
+- **Upstream PapaBench does not compile as-is with a modern GCC, and three Autopilot tasks do not exist as functions.** `autopilot/main.c` has a `ModeUpdate(...); else` syntax error (fixed by `papabench_ibex/patches/`, applied to a build copy), needs `-fgnu89-inline` and `-fcommon`; `pp_sqrt()` returns garbage (body under `#if 0`); FBW `servo_transmit` is never called (`_20Hz` is reset before `fbw_schedule()` can see 3). `navigation_task`, `reporting_task`, `receive_gps_data_task` are rebuilt in `harness/autopilot_glue.c` from the pieces `periodic_task()` and `mainloop.c` inline. Details: `.claude/reference/papabench.md`.
 
 ---
 
 ## 5. Notes
 
-- `README.md` (root) is the upstream TACLeBench README, for humans; it says nothing about Ibex. `.claude/reference/` is for the agent and is the one kept current. When they diverge, the code wins, then `.claude/reference/`.
+- `README.md` (root) is for humans: how to build/run PapaBench on Ibex, results, what was done, known limitations, followed by the upstream TACLeBench README. Keep its commands, results table and limitations in sync when they change. `.claude/reference/` is for the agent. When they diverge, the code wins, then `.claude/reference/`.
+- The Verilator simulator is built from the `Secure-Ibex/` submodule into `papabench_ibex/build/sim/` (`make sim`, FuseSoC `--build-root`); the submodule stays clean.
 - `Secure-Ibex/CLAUDE.md` governs the submodule; its rules (e.g. its own `tree.md`/`status.md`) apply only when working inside it, which this repo does not do.
 - Language: chat with the user in **Italian**; code, comments, docs and commit messages in **English**.

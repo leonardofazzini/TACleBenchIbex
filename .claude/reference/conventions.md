@@ -7,17 +7,32 @@
 
 ## Toolchain and flags
 
-- Compiler: `riscv32-unknown-elf-gcc` (lowRISC toolchain; install notes in `Secure-Ibex/README.md`).
-- Base flags (from Secure-Ibex `common.mk`, with our overrides): `-march=rv32im -mabi=ilp32 -static -mcmodel=medany -Wall -Wno-unknown-pragmas -g -Os -nostdlib -nostartfiles -ffreestanding`, link `-lgcc`.
-- PapaBench include paths (before any system include): `bench/parallel/PapaBench/sw/include`, `sw/var/include`, `sw/airborne/<prog>`, `arch/include/avr`, `arch/include/avr/arch`, plus the harness directory if it shadows `sfr_defs.h`.
+- Compiler: `/tools/riscv/riscv32/bin/riscv32-unknown-elf-gcc` (crosstool-NG, GCC 10.2). Single multilib, `rv32imc`/`ilp32`: `libgcc.a` contains compressed instructions.
+- All flags live in `papabench_ibex/Makefile` (`BASE_CFLAGS`, `PB_CFLAGS`, `IBEX_CFLAGS`, `LDFLAGS`); see `port-harness.md` for why each PapaBench flag is there.
 - Never `-DPAPABENCH_SINGLE`.
 
 ## Build and run (standard Ibex, Verilator)
 
-1. Once: build the simulator from `Secure-Ibex/` — `fusesoc --cores-root=. run --target=sim_ibex --setup --build riscv:soc:reference_system --verilator_options=-Wno-fatal`.
-2. Build a program: harness Makefile — `TODO: describe` once it exists.
-3. Run: `Secure-Ibex/build/riscv_soc_reference_system_0/sim_ibex-verilator/Vreference_system --meminit=ram,<prog>.elf`.
-4. Debug: add `-t` for a waveform; `riscv32-unknown-elf-objdump -d <prog>.elf` (or `make disassemble` via `common.mk`) to check that no compressed instructions and no AVR asm slipped in.
+From `papabench_ibex/`:
+
+- `make PROG=fbw` / `make PROG=autopilot` / `make all-progs` → `build/<prog>/<prog>.elf` (+ `.map`, `instrumented.txt`, `exclude.txt`).
+- `make PROG=<prog> run` → runs the simulator in `build/<prog>/` and prints `reference_system.log` (the results). Simulator stdout (statistics, performance counters) is in `sim.log`.
+- Variables: `TICKS=<n>` (scheduler ticks, default 61; the Autopilot adds 30 startup ticks), `TICK_CYCLES=<n>` (timer period, default 819200), `OPT=-O2` etc., `SIM=<path>`.
+- Simulator: default `SIM` is `papabench_ibex/build/sim/sim_ibex-verilator/Vreference_system`, built from the `Secure-Ibex/` submodule sources by `make sim` (also triggered by `run` when missing) with FuseSoC `--build-root`, so nothing is written inside the submodule. `make sim` needs the FuseSoC venv **activated** (the Secure-Ibex pre-build check runs `pip3 show edalize` from `PATH`) and Verilator 5.014/5.017 (5.014 installed). A venv exists at `~/01_Progetti_PC/Secure-Ibex/.venv` (sibling clone): `source ~/01_Progetti_PC/Secure-Ibex/.venv/bin/activate`. `FUSESOC=<path>` overrides the executable. `make distclean` also deletes the simulator.
+- Wall time with defaults: FBW ~1.5 min (50 M cycles), Autopilot ~2 min (75 M cycles); the two can run in parallel. For a quick check use e.g. `TICKS=10 TICK_CYCLES=20000`.
+- Debug: `make PROG=<prog> disassemble` → `build/<prog>/<prog>.dis`; run the simulator by hand with `-t` for a waveform. An exception prints `EXCEPTION!!!` with `MEPC`/`MCAUSE`/`MTVAL` in `reference_system.log` and halts.
+- `make PROG=<prog> vmem` produces a `.vmem` image (not needed by Verilator).
+
+Output format (`reference_system.log`):
+
+```
+PAPABENCH,<prog>,ticks=<n>,startup_ticks=<s>,tick_cycles=<c>
+overhead,<cycles>
+task,<name>,<count>,<min>,<max>,<avg>
+END
+```
+
+`count` = activations by the upstream scheduler; cycles include `overhead`. A task never activated prints `0,0,0,0`.
 
 Host sanity check of the upstream sources (not of the port): `bench/checkBenchmark.sh` (native `gcc`, `-Werror`).
 
@@ -31,10 +46,10 @@ Host sanity check of the upstream sources (not of the port): `bench/checkBenchma
 
 ### Measure one more task
 
-1. Confirm the entry point in `bench/parallel/PapaBench/PapaBench_for_wcet.txt` and its call site (`reference/papabench.md`).
-2. Add it to the harness measurement list (mechanism `TODO: describe` once chosen in `port-harness.md`).
-3. Rebuild, run on Verilator, check the new line in the output.
-4. Record the step in `.claude/status.md`.
+1. Confirm the entry point in `bench/parallel/PapaBench/PapaBench_for_wcet.txt` and its call site (`reference/papabench.md`); check with `nm` that it exists as a function (some tasks were inlined upstream).
+2. Declare the function(s) `void f( void );` in `harness/fbw_glue.c` or `harness/autopilot_glue.c` and add one line `PAPABENCH_TASK( "name", first, last ),` to `papabench_tasks[]` (single line, this exact form: the Makefile parses it). For a single function `first == last`; for a sequence inlined in the scheduler use its first and last call, after checking with `grep` that `first` is not called elsewhere.
+3. `make PROG=<prog>` must pass the instrumentation checks; `cat build/<prog>/instrumented.txt` shows the hooked functions. `make PROG=<prog> run`, check the new `task,` line (count > 0 if the scheduler activates it).
+4. Record the step in `.claude/status.md`; update the task list in `reference/port-harness.md` if the table changed meaning.
 
 ### Add a new harness file
 
