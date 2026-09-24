@@ -2,11 +2,11 @@
   Autopilot (ATmega128) peripheral model on the Ibex SoC (see periph.h).
 
   AVR source              Ibex resource               upstream ISR
-  Timer1 compare A        TimerA channel 0            __vector_12 link_fbw
+  Timer1 compare A        TimerD channel 0            __vector_12 link_fbw
   SPI master              TimerC channel 0            __vector_17 SPI
   ADC conversion          TimerB channel 0            __vector_21
   UART1 receive (GPS)     UART RX, IRQ 16             __vector_30 GPS
-  INT4 (modem clock)      GPIO gp_i[0], IRQ 17        __vector_5  modem
+  INT4 (modem clock)      GPIO gp_i[1], IRQ 21        __vector_5  modem
 
   SPI master: link_fbw_send() and the OCR1A ISR write SPDR to send a byte;
   the transfer (8 bits at the SPCR clock rate) starts at the first
@@ -18,7 +18,7 @@
   is what radio_control_task receives.
 
   GPS UBX bytes and the modem clock come from the simulation environment
-  (hw/rtl/papabench_env.sv) through the UART and gp_i[0]; the modem data bit
+  (hw/rtl/papabench_env.sv) through the UART and gp_i[1]; the modem data bit
   (PORTD.6) goes out on gp_o.
 */
 
@@ -69,7 +69,7 @@ static void ap_counters( void )
 
 /* ------------------------------------------------------------- Timer1 --- */
 
-static struct pb_oc ap_oc = { &pb_timer_a, 0 };
+static struct pb_oc ap_oc = { &pb_timer_d, 0 };
 
 
 static void ap_oc1a_event( void )
@@ -129,8 +129,13 @@ static void ap_spi_sync( void )
 {
   static const unsigned int div[ 4 ] = { 4, 16, 64, 128 };
 
+  /* An SPDR access with the SPI off starts nothing (the frame's last byte
+     is read right before SPI_STOP()): consume it, or a sync point between
+     the next SPI_START() and its SPDR write would start a spurious
+     transfer and shift the frame by one byte */
   if ( !( SPCR & _BV( SPE ) ) || !( SPCR & _BV( MSTR ) ) ) {
     ap_spi_in_frame = 0;
+    ap_spi_seen = papabench_spdr_accesses;
     return;
   }
   if ( ap_spi_busy || papabench_spdr_accesses == ap_spi_seen )
@@ -185,7 +190,7 @@ static void ap_adc_sync( void )
 
 /* ---------------------------------------------------------------- GPS --- */
 
-void papabench_irq_uart( void )
+static void ap_gps_irq( void )
 {
   while ( !( IBEX_REG( IBEX_UART + IBEX_UART_STATUS ) & IBEX_UART_RX_EMPTY ) ) {
     UDR1 = ( unsigned char ) IBEX_REG( IBEX_UART + IBEX_UART_RX );
@@ -197,12 +202,12 @@ void papabench_irq_uart( void )
 
 /* -------------------------------------------------------------- modem --- */
 
-static unsigned char ap_gpio_on;
+static unsigned char ap_modem_on;
 
 
-void papabench_irq_gpio( void )
+static void ap_modem_irq( void )
 {
-  pb_gpio_ack();
+  pb_gpo_toggle( PB_GPO_MODEM_ACK );
   if ( EIMSK & _BV( INT4 ) ) {
     papabench_isr_run( AP_ISR_MODEM, __vector_5 );
     pb_gpo_write( PB_GPO_MODEM_TX,
@@ -213,31 +218,43 @@ void papabench_irq_gpio( void )
 
 /* INT4 enabled by MODEM_CHECK_RUNNING(), disabled by the ISR when the
    buffer is empty */
-static void ap_gpio_sync( void )
+static void ap_modem_sync( void )
 {
   unsigned char on = ( EIMSK & _BV( INT4 ) ) != 0;
 
-  if ( on == ap_gpio_on )
+  if ( on == ap_modem_on )
     return;
-  ap_gpio_on = on;
+  ap_modem_on = on;
   if ( on )
-    ibex_irq_enable( IBEX_IRQ_GPIO );
+    ibex_irq_enable( IBEX_IRQ_GPIO1 );
   else
-    ibex_irq_disable( IBEX_IRQ_GPIO );
+    ibex_irq_disable( IBEX_IRQ_GPIO1 );
 }
 
 
 /* --------------------------------------------------------------- init --- */
 
+const struct papabench_irq papabench_irqs[] = {
+  { IBEX_IRQ_TIMER_B, papabench_irq_timer_b, 1 },
+  { IBEX_IRQ_TIMER_C, papabench_irq_timer_c, 1 },
+  { IBEX_IRQ_TIMER_D, papabench_irq_timer_d, 1 },
+  { IBEX_IRQ_UART, ap_gps_irq, 1 },
+  { IBEX_IRQ_GPIO1, ap_modem_irq, 0 },
+};
+
+const unsigned int papabench_nirqs =
+  sizeof( papabench_irqs ) / sizeof( papabench_irqs[ 0 ] );
+
+
 void papabench_periph_init( void )
 {
-  pb_timer_a.fn[ 0 ] = ap_oc1a_event;
+  pb_timer_d.fn[ 0 ] = ap_oc1a_event;
   pb_timer_b.fn[ 0 ] = ap_adc_event;
   pb_timer_c.fn[ 0 ] = ap_spi_event;
   ap_spi_seen = papabench_spdr_accesses;
 
-  pb_gpo_write( PB_GPO_MODE_MASK | PB_GPO_MODEM_TX,
-                ( PB_ENV_AUTOPILOT << PB_GPO_MODE_SHIFT ) | PB_GPO_MODEM_TX );
+  pb_gpo_write( PB_GPO_ENV_AUTOPILOT | PB_GPO_MODEM_TX,
+                PB_GPO_ENV_AUTOPILOT | PB_GPO_MODEM_TX );
 }
 
 
@@ -246,6 +263,6 @@ void papabench_periph_poll( void )
   pb_oc_sync( &ap_oc, TIMSK & _BV( OCIE1A ), OCR1A );
   ap_spi_sync();
   ap_adc_sync();
-  ap_gpio_sync();
+  ap_modem_sync();
   pb_avr_snapshot_done();
 }

@@ -14,7 +14,9 @@ task activation and every interrupt handler call. The AVR peripherals the
 programs were written for are modelled on the SoC's real peripherals: the
 upstream interrupt handlers run from real Ibex interrupts (timers, UART,
 GPIO), the servos drive the PWM, and radio, GPS and modem signals come from a
-deterministic simulation environment.
+deterministic simulation environment. No Ibex peripheral is used by the two
+programs for two different functions, so the same peripheral map would hold
+if both ever ran on one SoC.
 
 - `bench/` holds the upstream TACLeBench sources. It is read-only: PapaBench
   is compiled from it unmodified.
@@ -82,9 +84,9 @@ Run from `papabench_ibex/`:
 | `make PROG=fbw` / `make PROG=autopilot` | Build `build/<prog>/<prog>.elf` |
 | `make all-progs` | Build both programs |
 | `make PROG=<prog> run` | Build, simulate and print `build/<prog>/reference_system.log` |
-| `make PROG=<prog> MEASURE=0 run` | Same scenario with no measurement at all (no instrumentation hooks, no calibration, no results): the program just runs for `TICKS` ticks. Built in `build/<prog>-nomeasure/`; the output is the header line and `END`, the UART output is in `uart0.log` |
+| `make PROG=<prog> MEASURE=0 run` | Same scenario with no measurement at all (no instrumentation hooks, no calibration, no results): the program just runs for `TICKS` ticks. Built in `build/<prog>-nomeasure/`; the output is the header line and `END`, the servo pulses are in `pwm.log` |
 | `make sim` | (Re)build the Verilator model from `Secure-Ibex/` + `hw/patches/` (FuseSoC target `sim_ibex`) into `build/sim/` |
-| `make hwtest` | Smoke test of the SoC patches (TimerC IRQ 20, 20-bit PWM) on the simulator |
+| `make hwtest` | Smoke test of the SoC patches (TimerC/D/E on IRQ 20/22/23, `gp_i[1]` on IRQ 21, 20-bit PWM, `pwm.log`) on the simulator |
 | `make PROG=<prog> disassemble` | Write `build/<prog>/<prog>.dis` |
 | `make PROG=<prog> vmem` | Write a `.vmem` image (not needed by Verilator) |
 | `make PROG=<prog> clean` | Remove `build/<prog>/` |
@@ -106,8 +108,17 @@ All files a run produces are in `build/<prog>/`:
 
 - `reference_system.log` holds the results, written through SimCtrl.
 - `sim.log` holds the simulator's stdout.
+- `pwm.log` lists every PWM pulse (rising-edge cycle, channel, width in
+  cycles), written by a monitor in the simulation top. For FBW these are the
+  servo outputs. Read it with
+  `papabench_ibex/scripts/decode_pwm.py build/fbw/pwm.log`, which prints one
+  line per 20 ms servo period with the width of each servo in µs
+  (`--every N` prints one period out of N). The Autopilot drives no servo,
+  so its `pwm.log` is empty.
 - `uart0.log` and `reference_system_pcount.csv` are also written by the
-  simulator.
+  simulator. `uart0.log` stays empty: neither program transmits on the Ibex
+  UART (FBW's AVR UART is virtual, see section 6; the Autopilot's downlink
+  is the modem).
 - The build leaves the `.elf`, the `.map` and the instrumentation lists
   described below.
 
@@ -120,6 +131,7 @@ PAPABENCH,<prog>,ticks=<n>,startup_ticks=<s>,tick_cycles=<c>
 overhead,<cycles>
 task,<name>,<count>,<min>,<max>,<avg>
 ...
+trap_overhead,<cycles>
 isr_overhead,<cycles>
 isr,<name>,<count>,<min>,<max>,<avg>
 ...
@@ -133,7 +145,8 @@ END
   include the measurement overhead printed on the `overhead` line, and
   exclude the cycles spent in every interrupt handler body (scheduler tick
   and peripheral models). They do include the trap entry/exit of those
-  interrupts.
+  interrupts: `trap_overhead` is its value measured at start-up, printed
+  for reference and not subtracted.
 - `isr` samples time the upstream handler (`__vector_N`) alone, plus the
   `isr_overhead`.
 
@@ -142,19 +155,19 @@ identical results, cycle for cycle.
 
 | Program | Task | Activations | Cycles min / max / avg |
 |---|---|---|---|
-| FBW | `check_failsafe_task` | 60 | invalid: one negative sample (see Known limitations) |
-| FBW | `check_mega128_values_task` | 60 | 38 / 2882 / 278 |
-| FBW | `send_data_to_autopilot_task` | 60 | 22 / 1258 / 440 |
-| FBW | `servo_transmit` | 19 | 669 / 727 / 700 |
-| FBW | `test_ppm_task` | 60 | 15 / 5608 / 2961 |
+| FBW | `check_failsafe_task` | 60 | 34 / 2258 / 119 |
+| FBW | `check_mega128_values_task` | 60 | 38 / 3055 / 290 |
+| FBW | `send_data_to_autopilot_task` | 60 | 33 / 1353 / 451 |
+| FBW | `servo_transmit` | 19 | 825 / 1257 / 989 (every activation is hit by interrupts, see Known limitations) |
+| FBW | `test_ppm_task` | 60 | 46 / 7707 / 3311 |
 | Autopilot | `altitude_control_task` | 4 | 38 (take-off block, see Known limitations) |
 | Autopilot | `climb_control_task` | 4 | 60 |
-| Autopilot | `link_fbw_send` | 20 | 108 / 195 / 113 |
-| Autopilot | `navigation_task` | 4 | 1910 / 2319 / 2143 |
-| Autopilot | `radio_control_task` | 20 | 291 / 1492 / 424 |
-| Autopilot | `receive_gps_data_task` | 12 | 282 / 7997 / 1798 |
-| Autopilot | `reporting_task` | 10 | 716 / 1365 / 959 |
-| Autopilot | `stabilisation_task` | 20 | 1807 / 1983 / 1906 |
+| Autopilot | `link_fbw_send` | 20 | 108 / 195 / 112 |
+| Autopilot | `navigation_task` | 4 | 2082 / 2317 / 2185 |
+| Autopilot | `radio_control_task` | 20 | 291 / 1492 / 429 |
+| Autopilot | `receive_gps_data_task` | 12 | 282 / 7996 / 1798 |
+| Autopilot | `reporting_task` | 10 | 716 / 1365 / 950 |
+| Autopilot | `stabilisation_task` | 20 | 1807 / 1984 / 1889 |
 
 | Program | Interrupt handler | Calls | Cycles min / max / avg |
 |---|---|---|---|
@@ -162,12 +175,12 @@ identical results, cycle for cycle.
 | FBW | `servo(__vector_6)` | 673 | 53 / 65 / 54 |
 | FBW | `spi(__vector_10)` | 461 | 92 / 157 / 153 |
 | FBW | `uart_tx(__vector_13)` | 500 | 21 / 34 / 33 |
-| FBW | `adc(__vector_14)` | 8795 | 49 / 71 / 56 |
+| FBW | `adc(__vector_14)` | 8788 | 49 / 71 / 56 |
 | Autopilot | `modem(__vector_5)` | 4129 | 27 / 73 / 42 |
 | Autopilot | `link_fbw_oc1a(__vector_12)` | 460 | 113 / 136 / 134 |
 | Autopilot | `spi(__vector_17)` | 460 | 47 |
 | Autopilot | `gps_uart1_rx(__vector_30)` | 470 | 34 / 76 / 62 |
-| Autopilot | `adc(__vector_21)` | 12728 | 47 / 68 / 52 |
+| Autopilot | `adc(__vector_21)` | 12777 | 47 / 68 / 52 |
 
 The measurement overhead is 23 cycles for tasks and 5 for handlers. FBW runs
 50 M cycles and the Autopilot 75 M cycles (30 start-up ticks + 61).
@@ -181,12 +194,12 @@ control tasks take their long paths:
 |---|---|---|
 | `altitude_control_task` | 39 | 38 / 416 / 57 |
 | `climb_control_task` | 39 | 60 / 1668 / 140 |
-| `link_fbw_send` | 200 | 108 / 453 / 113 |
-| `navigation_task` | 39 | 1910 / 6300 / 2408 |
-| `radio_control_task` | 200 | 291 / 1492 / 304 |
-| `receive_gps_data_task` | 118 | 282 / 12881 / 2932 |
-| `reporting_task` | 100 | 716 / 1365 / 915 |
-| `stabilisation_task` | 200 | 1807 / 2053 / 1890 |
+| `link_fbw_send` | 200 | 108 / 195 / 108 |
+| `navigation_task` | 39 | 2082 / 6299 / 2399 |
+| `radio_control_task` | 200 | 291 / 1492 / 312 |
+| `receive_gps_data_task` | 119 | 282 / 13136 / 2906 |
+| `reporting_task` | 100 | 716 / 1365 / 923 |
+| `stabilisation_task` | 200 | 1807 / 2056 / 1888 |
 
 | Interrupt handler | Calls | Cycles min / max / avg |
 |---|---|---|
@@ -194,7 +207,7 @@ control tasks take their long paths:
 | `link_fbw_oc1a(__vector_12)` | 4600 | 113 / 136 / 134 |
 | `spi(__vector_17)` | 4600 | 47 |
 | `gps_uart1_rx(__vector_30)` | 3854 | 34 / 76 / 66 |
-| `adc(__vector_21)` | 88091 | 47 / 68 / 52 |
+| `adc(__vector_21)` | 88345 | 47 / 68 / 52 |
 
 
 What was done
@@ -236,7 +249,7 @@ What was done
       `fbw_schedule()` could see it reach 3. The patch moves the reset
       into `fbw_schedule()`, right before the call, so `servo_transmit`
       runs once every 3 ticks (about 20 Hz) and sends its 23-byte servo
-      frame (10 pulse widths) on the UART.
+      frame (10 pulse widths) on the AVR UART (virtual here, section 6).
   - `ad7714.c` and `gps_sirf.c` are unused and do not compile, so they are
     not built.
 - **Flow facts.** The loop-bound and entry-point pragmas (WCET flow facts)
@@ -317,13 +330,17 @@ Current patches:
 | `0001-soc-timer-c.patch` | TimerC at `0x80030000`, fast IRQ 20 (`mip` bit 20), same `timer.sv` as the other timers |
 | `0002-soc-pwm-ctr-size.patch` | PWM counter width becomes a parameter (default 8, as before); the simulation top sets 20 bits, enough for a 20 ms servo period at 50 MHz |
 | `0003-sim-top-papabench-env.patch` | The simulation top instantiates our environment, `papabench_ibex/hw/rtl/papabench_env.sv`, which drives the GPIO inputs and the UART RX line (section 6) |
+| `0004-soc-timers-d-e-gpio-irq.patch` | TimerD at `0x80040000` (fast IRQ 22) and TimerE at `0x80050000` (fast IRQ 23), same `timer.sv`; `gp_i[1]` becomes a second level-sensitive GPIO interrupt line, fast IRQ 21. They give every function its own peripheral (section 6) |
+| `0005-sim-top-pwm-monitor.patch` | The simulation top instantiates `papabench_ibex/hw/rtl/papabench_pwm_monitor.sv`, which logs every PWM pulse to `pwm.log` (the PWM cannot be read back) |
 
-`make hwtest` checks them: TimerC raises exactly its periodic interrupts on
-IRQ 20 and never before the compare time, TimerA/TimerB stay quiet, and
-`pwm_o[0]` on the waveform has the programmed pulse (75000 cycles) and
-period (100001 cycles). With patches 0001 and 0002 only, both PapaBench
-programs gave cycle-identical results on the patched and on the unpatched
-model.
+`make hwtest` checks them: TimerC, TimerD and TimerE each raise exactly
+their periodic interrupts on their own line (IRQ 20, 22, 23), never before
+the compare time, and no other line fires; with the Autopilot environment
+enabled, the modem clock raises IRQ 21 once per edge (acknowledged through
+`gp_o[6]`) while IRQ 17 stays quiet; `pwm_o[0]` on the waveform and in
+`pwm.log` has the programmed pulse (75000 cycles) and period (100001
+cycles). With patches 0001 and 0002 only, both PapaBench programs gave
+cycle-identical results on the patched and on the unpatched model.
 
 ### 6. Real interrupts and peripherals
 
@@ -333,16 +350,33 @@ model (`harness/fbw_periph.c`, `harness/autopilot_periph.c`, on top of
 The upstream interrupt handlers (`__vector_N`, plain C functions on RISC-V)
 run from real Ibex interrupts:
 
-| AVR source | FBW handler | Autopilot handler | On the Ibex SoC |
+**One peripheral, one function.** The two programs are built and run
+separately, but no Ibex peripheral serves two different functions across
+them, so the same map would hold if both ever shared the SoC. A peripheral
+is shared only when it does the same job in both programs (the ADC timer,
+the SPI link timer). Each program's model lists the interrupts it owns and
+touches no other peripheral.
+
+| Function | FBW handler | Autopilot handler | On the Ibex SoC |
 |---|---|---|---|
-| Timer1 compare | servo (`__vector_6`) | FBW link byte pacing (`__vector_12`) | TimerA, IRQ 18 |
+| Servo pulses (Timer1 compare) | servo (`__vector_6`) | — | TimerA, IRQ 18 |
 | ADC | `__vector_14` | `__vector_21` (IR sensors) | TimerB, IRQ 19 |
-| SPI | slave (`__vector_10`) | master (`__vector_17`) | TimerC, IRQ 20 |
-| UART TX | boot string and `servo_transmit` frames (`__vector_13`) | — | TimerC + real UART TX (`uart0.log`) |
-| Radio PPM input capture | `__vector_5` | — | environment → GPIO, IRQ 17 |
-| Modem clock (INT4) | — | downlink bits (`__vector_5`) | environment → GPIO, IRQ 17 |
-| GPS (UART1 RX) | — | UBX parser (`__vector_30`) | environment → real UART RX, IRQ 16 |
-| Servo outputs | 10 channels | — | PWM channels 0–9, real 1–2 ms pulses |
+| SPI link between the MCUs | slave (`__vector_10`) | master (`__vector_17`) | TimerC, IRQ 20 |
+| FBW link byte pacing (Timer1 compare) | — | `__vector_12` | TimerD, IRQ 22 (patch 0004) |
+| AVR UART TX (virtual) | boot string and `servo_transmit` frames (`__vector_13`) | — | TimerE, IRQ 23 (patch 0004); bytes dropped |
+| Radio PPM input capture | `__vector_5` | — | environment → `gp_i[0]`, IRQ 17 |
+| Modem clock (INT4) | — | downlink bits (`__vector_5`) | environment → `gp_i[1]`, IRQ 21 (patch 0004); data bit on `gp_o[3]` |
+| GPS (UART1 RX) | — | UBX parser (`__vector_30`) | environment → UART RX, IRQ 16 |
+| Servo outputs | 10 channels | — | PWM channels 0–9, real 1–2 ms pulses (`pwm.log`) |
+| Scheduler tick | polled | polled | machine timer, IRQ 7 (also the models' time base, read only) |
+
+- **FBW's UART is virtual.** The servos are only on the PWM. The upstream
+  FBW still writes its boot string and the `servo_transmit` frames to its
+  AVR UART (on the real board, a debug serial port), so the model keeps the
+  transmitter's timing: one byte time at 38400 baud per byte on TimerE, then
+  the transmit-complete handler runs from the TimerE interrupt, as with a
+  real UART. The bytes themselves are dropped; the servo outputs are read
+  from `pwm.log`.
 
 - **When a model acts.** Models look at the registers at deterministic
   synchronisation points: at the end of every interrupt handler, and on
@@ -366,10 +400,13 @@ run from real Ibex interrupts:
   - Autopilot: the modem clock (4800 Hz), and GPS UBX bursts (NAV-POSUTM,
     NAV-STATUS, NAV-VELNED) at 4 Hz on the UART, for a circle flight at
     200 m and 15 m/s.
-  The GPIO line into the core is level-sensitive and the GPIO has no
-  interrupt register, so the environment latches each edge; the handler
-  acknowledges it by toggling a GPIO output bit. The program selects what
-  the environment plays through two other GPIO output bits.
+  Each input has its own pin: PPM on `gp_i[0]`, modem clock on `gp_i[1]`,
+  GPS on the UART RX line. The GPIO lines into the core are
+  level-sensitive and the GPIO has no interrupt register, so the
+  environment latches each edge; the handler acknowledges it by toggling
+  its own GPIO output bit (`gp_o[0]` for PPM, `gp_o[6]` for the modem). Each
+  program enables its own stimuli through one more output bit (`gp_o[1]`
+  FBW, `gp_o[2]` Autopilot); both could be enabled at once.
 
 ### 7. The simulated scenario
 
@@ -381,7 +418,7 @@ clock, so every run is the same flight. Times below are simulated time
 
 | Input | Source | What it contains |
 |---|---|---|
-| Radio (PPM) | `gen_stimulus.py` → environment → GPIO | One frame every 25 ms (first edge at 1 ms; sync gap at least 8 ms), 9 channels. Throttle 1600 µs; roll stick sweeping 1300 → 1900 → 1300 µs in steps of 75 µs, one step per frame (a 400 ms triangle); pitch, yaw and the other channels at 1500 µs; mode stick 1100 µs (MANUAL) for the first 20 frames (0.5 s), then 1900 µs (AUTO). The 40-frame table (1 s) repeats. |
+| Radio (PPM) | `gen_stimulus.py` → environment → `gp_i[0]` | One frame every 25 ms (first edge at 1 ms; sync gap at least 8 ms), 9 channels. Throttle 1600 µs; roll stick sweeping 1300 → 1900 → 1300 µs in steps of 75 µs, one step per frame (a 400 ms triangle); pitch, yaw and the other channels at 1500 µs; mode stick 1100 µs (MANUAL) for the first 20 frames (0.5 s), then 1900 µs (AUTO). The 40-frame table (1 s) repeats. |
 | Autopilot commands (SPI) | `fbw_periph.c`, `fbw_spi_frame()` | One 23-byte frame every 3 ticks (49 ms, the Autopilot's `link_fbw_send()` rate), the first after 1 tick. Throttle `MAX_PPRZ`; roll sweeping −`MAX_PPRZ`/4 … +`MAX_PPRZ`/4 over 16 frames; pitch `MAX_PPRZ`/10; status "autopilot OK"; upstream XOR checksum. |
 | ADC | `fbw_periph.c`, `fbw_adc_sample()` | Channel 3 (supply) 629 = 11.1 V; channel 6 (servo supply) 281 = 5.0 V; other channels 0. One conversion every 13 × 128 AVR clocks (104 µs). |
 
@@ -389,10 +426,10 @@ FBW therefore starts in MANUAL mode, driving the servos from the radio. The
 mode channel is averaged over 10 frames (upstream `AVERAGING_PERIOD`), so
 FBW switches to AUTO at the first average taken over AUTO frames only,
 about 0.75 s in; from then on it drives the servos from the Autopilot's
-commands. The servo frames in `uart0.log` show it: the ailerons follow the
-roll stick sweep (about 1430–1680 µs) in MANUAL, then from the 16th frame
-(about 0.78 s) the motor goes to 1999 µs and the elevator to 1559 µs, as
-commanded by the Autopilot frames.
+commands. The servo pulses in `pwm.log` show it: the ailerons follow the
+roll stick sweep (about 1435–1705 µs) in MANUAL, then from the servo period
+starting at 0.78 s the motor (channel 9) goes to 2000 µs and the elevator
+to 1560 µs, as commanded by the Autopilot frames.
 
 **Autopilot**
 
@@ -400,7 +437,7 @@ commanded by the Autopilot frames.
 |---|---|---|
 | FBW status (SPI) | `autopilot_periph.c`, `ap_spi_frame()` | The answer to each `link_fbw_send()` frame (every 3 ticks): radio OK with averaged channels; mode stick MANUAL for frames 0–1, AUTO1 for frames 2–3, AUTO2 from frame 4 (after about 0.7 s); throttle `MAX_PPRZ` (above the take-off threshold); `ppm_cpt` 40; supply 11.1 V; upstream XOR checksum. |
 | GPS (UBX on the UART) | `gen_stimulus.py` → environment → UART RX | One burst every 250 ms from 250 ms: NAV-POSUTM, NAV-STATUS, NAV-VELNED (94 bytes at 115200 baud), with valid UBX checksums. 3D fix; a counter-clockwise circle of radius 80 m centred 60 m east and 40 m south of the flight-plan origin (`NAV_UTM_EAST0/NORTH0`), at 15 m/s ground speed and 200 m altitude, no climb. The 120-epoch table (30 s) repeats, so after 30 s the position jumps back to the start of the circle. |
-| Modem clock | environment → GPIO | A 4800 Hz square wave; the handler sends one downlink bit per falling edge while it has data. |
+| Modem clock | environment → `gp_i[1]` | A 4800 Hz square wave; the handler sends one downlink bit per falling edge while it has data. |
 | Infrared sensors (ADC) | `autopilot_periph.c`, `ap_adc_sample()` | Channels 1 and 2: the level-attitude values 402 and 512 (from the airframe's IR neutrals), both plus a roll oscillation of ±20 counts, a triangle with a 2 s period. Other channels 0. One conversion every 104 µs. |
 
 The Autopilot therefore spends its 30-tick start-up wait (0.5 s), goes from
@@ -427,12 +464,6 @@ Known limitations
   microcontroller's frames are one deterministic scenario (see section 7).
   Other flights need a new `gen_stimulus.py` table (then `make sim`) or new
   frames in the models.
-- **Some FBW task samples come out negative.** In the default run
-  `check_failsafe_task` has one sample of −1 (printed as 4294967295), which
-  also spoils its average; before the scheduling patch other FBW tasks had
-  similar samples. The harness subtracts a calibrated trap entry/exit cost
-  (`trap_overhead`) for every interrupt, and for some interrupts this seems
-  to exceed the real cost. Not investigated yet.
 - **`altitude_control_task` stays short in the default run.** The upstream
   flight plan holds the take-off block until 8 s of flight time; only then
   does it switch to altitude hold. A default run simulates 1.5 s; the long
@@ -455,8 +486,19 @@ Known limitations
     The modem (Autopilot, 4800 Hz while it transmits), the PPM edges (FBW),
     the SPI bytes and the GPS bytes add more.
   - Effect on the results: `min` is the cost of the task with no interrupt
-    inside it. `max` and `avg` include these trap costs, as they would on a
-    real microcontroller with its interrupts enabled.
+    inside it, unless every activation is hit. `servo_transmit` runs every
+    3 ticks, in step with the virtual Autopilot's SPI frames (also every
+    3 ticks), so all its samples contain SPI interrupts and its `min` too.
+    `max` and `avg` include these trap costs, as they would on a real
+    microcontroller with its interrupts enabled.
+  - Why the trap is not subtracted: until 2026-09-24 the harness subtracted
+    a calibrated constant per interrupt (`trap_overhead`, about 100
+    cycles). The real cost depends on where the interrupt lands and was
+    sometimes lower, so hit samples came out below the task's real cost,
+    even negative (`check_failsafe_task` −1, `send_data_to_autopilot_task`
+    −2), and several minima were too low (`check_failsafe_task` 22 instead
+    of 34, `test_ppm_task` 15 instead of 46). The constant is still
+    measured and printed as `trap_overhead`, for reference.
 - **GPS messages dropped upstream.** The UBX parser and the modem share the
   globals `ck_a`/`ck_b` (merged by `-fcommon`), and the parser drops a
   message while the previous one is unread (for example during the
@@ -481,16 +523,17 @@ Repository layout
 |---|---|
 | `papabench_ibex/Makefile` | Build, instrumentation lists, simulator build, run |
 | `papabench_ibex/include/arch/sfr_defs.h` | AVR register shim and tick test-and-clear |
-| `papabench_ibex/harness/harness.c` | `main()`, timer ISR, instrumentation hooks, report |
+| `papabench_ibex/harness/harness.c` | `main()`, the interrupt wrapper and tick, instrumentation hooks, report |
 | `papabench_ibex/harness/{fbw,autopilot}_glue.c` | Task tables (`PAPABENCH_TASK( name, first, last )`) |
 | `papabench_ibex/harness/runtime.c` | Register array, tick flag and idle synchronisation point, `memcpy`/`memset` |
 | `papabench_ibex/harness/periph.{h,c}` | Peripheral-model layer: timer event channels, AVR time, Timer1 compare, GPIO, `SPDR` |
-| `papabench_ibex/harness/{fbw,autopilot}_periph.c` | Per-program peripheral models and handler tables |
-| `papabench_ibex/harness/ibex_io.h` | SoC register map and CSR helpers |
+| `papabench_ibex/harness/{fbw,autopilot}_periph.c` | Per-program peripheral models, handler tables and the Ibex interrupts each program owns |
+| `papabench_ibex/harness/ibex_io.h` | SoC register map, the one-peripheral-one-function map, CSR helpers |
 | `papabench_ibex/link.ld` | Linker script (whole 128 KiB RAM) |
 | `papabench_ibex/harness/calib.c` | Empty instrumented function for the overhead |
 | `papabench_ibex/patches/` | Upstream bug fixes applied to build copies |
-| `papabench_ibex/hw/` | SoC hardware patches, our FuseSoC cores, simulation environment (`rtl/`), stimulus generator (`stimulus/`), `hwtest` smoke test |
+| `papabench_ibex/hw/` | SoC hardware patches, our FuseSoC cores, simulation environment and PWM monitor (`rtl/`), stimulus generator (`stimulus/`), `hwtest` smoke test |
+| `papabench_ibex/scripts/decode_pwm.py` | Host decoder of `pwm.log` into servo widths |
 | `bench/parallel/PapaBench/` | Upstream PapaBench (read-only) |
 | `Secure-Ibex/` | Ibex SoC submodule |
 | `CLAUDE.md`, `.claude/` | Project notes: design details, decisions and status |

@@ -1,6 +1,6 @@
 /*
   Generic part of the AVR peripheral models (see periph.h): event channels on
-  TimerA/B/C, Timer1 compare arithmetic, timer counters, GPIO output shadow,
+  TimerA..E, Timer1 compare arithmetic, timer counters, GPIO output shadow,
   the SPDR double register. Compiled with the PapaBench flags of the program
   being built, but uses no AVR register name, so it is the same for both.
 */
@@ -11,6 +11,8 @@
 struct pb_timer pb_timer_a = { IBEX_TIMER_A };
 struct pb_timer pb_timer_b = { IBEX_TIMER_B };
 struct pb_timer pb_timer_c = { IBEX_TIMER_C };
+struct pb_timer pb_timer_d = { IBEX_TIMER_D };
+struct pb_timer pb_timer_e = { IBEX_TIMER_E };
 
 
 /* -------------------------------------------------------------- timers --- */
@@ -19,12 +21,12 @@ pb_time_t pb_now( void )
 {
   unsigned int hi, lo;
 
-  /* All timers count the same clock from the same reset: TimerA's mtime
-     is the time base of every model */
+  /* All timers count the same clock from the same reset: the machine
+     timer's mtime (read only) is the time base of every model */
   do {
-    hi = IBEX_REG( IBEX_TIMER_A + IBEX_MTIMEH );
-    lo = IBEX_REG( IBEX_TIMER_A + IBEX_MTIME );
-  } while ( hi != IBEX_REG( IBEX_TIMER_A + IBEX_MTIMEH ) );
+    hi = IBEX_REG( IBEX_TIMER + IBEX_MTIMEH );
+    lo = IBEX_REG( IBEX_TIMER + IBEX_MTIME );
+  } while ( hi != IBEX_REG( IBEX_TIMER + IBEX_MTIMEH ) );
   return ( ( pb_time_t ) hi << 32 ) | lo;
 }
 
@@ -92,6 +94,18 @@ void papabench_irq_timer_b( void )
 void papabench_irq_timer_c( void )
 {
   pb_timer_irq( &pb_timer_c );
+}
+
+
+void papabench_irq_timer_d( void )
+{
+  pb_timer_irq( &pb_timer_d );
+}
+
+
+void papabench_irq_timer_e( void )
+{
+  pb_timer_irq( &pb_timer_e );
 }
 
 
@@ -169,12 +183,6 @@ void pb_gpo_toggle( unsigned int mask )
 {
   pb_gpo ^= mask;
   IBEX_REG( IBEX_GPIO + IBEX_GPIO_OUT ) = pb_gpo;
-}
-
-
-void pb_gpio_ack( void )
-{
-  pb_gpo_toggle( PB_GPO_ACK );
 }
 
 

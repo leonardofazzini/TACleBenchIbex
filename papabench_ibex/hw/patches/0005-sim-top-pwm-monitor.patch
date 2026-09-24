@@ -1,0 +1,24 @@
+Secure-Ibex SoC patch (PapaBench on Ibex): the Verilator top instantiates
+papabench_pwm_monitor (hw/rtl/papabench_pwm_monitor.sv), which logs every
+PWM pulse (rising-edge cycle, channel, width) to pwm.log.
+Applied by 'make sim' after 0003, to a copy under build/sim/hw/ (patch -p1).
+
+--- a/rtl/top_simulation/reference_system.sv
++++ b/rtl/top_simulation/reference_system.sv
+@@ -91,6 +91,16 @@
+     .uart_rx_o (uart_rx)
+   );
+ 
++  // PapaBench-on-Ibex patch: every PWM pulse is logged to pwm.log (the PWM
++  // has no read-back; the FBW servos are only on the PWM).
++  papabench_pwm_monitor #(
++    .Channels (PwmWidth)
++  ) u_papabench_pwm_monitor (
++    .clk_i  (clk_sys_i),
++    .rst_ni (rst_sys_ni),
++    .pwm_i  (pwm_o)
++  );
++
+   //UART dpi interface
+   uartdpi #(//@audit-info inizializzazione della uart nel simple-system
+       .BAUD('d115_200),

@@ -70,11 +70,22 @@ void papabench_periph_init( void );
 /* Program model: synchronisation point, called with interrupts disabled */
 void papabench_periph_poll( void );
 
-/* Interrupt dispatch, called by the harness wrappers of the Ibex IRQs */
-void papabench_irq_timer_a( void );
-void papabench_irq_timer_b( void );
-void papabench_irq_timer_c( void );
-void papabench_irq_uart( void );
-void papabench_irq_gpio( void );
+/*
+  Ibex interrupts owned by the program's model (see the peripheral map in
+  ibex_io.h). The harness installs its interrupt wrapper only on these lines
+  and routes interrupt 'irq' (mcause number) to 'dispatch', then calls
+  papabench_periph_poll(). 'enable': 1 = enabled at start-up (a timer or the
+  UART, which only interrupt once the model arms them), 0 = the model
+  enables the line itself when the upstream code enables its AVR interrupt.
+  The machine timer (IRQ 7) belongs to the harness and is not listed.
+*/
+struct papabench_irq {
+  unsigned int irq;
+  papabench_fn_t dispatch;
+  unsigned int enable;
+};
+
+extern const struct papabench_irq papabench_irqs[];
+extern const unsigned int papabench_nirqs;
 
 #endif /* PAPABENCH_HARNESS_H */

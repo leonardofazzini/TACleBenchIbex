@@ -18,14 +18,17 @@
   function); a task timed from first to last function of a sequence also
   contains the calls between them.
 
-  The AVR peripherals are modelled on real Ibex peripherals (periph.h). Each
-  Ibex interrupt the models use (TimerA/B/C, UART RX, GPIO) has a wrapper here
-  that calls the model's dispatcher and then its synchronisation point; the
-  upstream ISRs the model calls are timed one by one (papabench_isr_run). For
-  every interrupt, tick included, the wrapper body plus the trap entry/exit
-  cost (register save and restore, mret; measured at start-up, printed as
-  trap_overhead) is added to harness_isr_cycles and subtracted from the task
-  samples, so task samples exclude interrupts entirely.
+  The AVR peripherals are modelled on real Ibex peripherals (periph.h). The
+  program's model lists the Ibex interrupts it owns (papabench_irqs[]); the
+  harness installs one wrapper on them and on the tick, which calls the
+  dispatcher of the interrupt taken and then the models' synchronisation
+  point. The upstream ISRs the model calls are timed one by one
+  (papabench_isr_run). For every interrupt, tick included, the wrapper body
+  (between its two mcycle reads) is added to harness_isr_cycles and
+  subtracted from the task samples. The trap entry/exit cost (register save
+  and restore, mret) is not subtracted: a sample hit by an interrupt keeps
+  it. It is measured at start-up and printed as trap_overhead, for
+  reference only.
 
   After PAPABENCH_TICKS scheduler ticks (plus the program's startup ticks)
   the ISR prints the results on SimCtrl and halts the simulation:
@@ -73,6 +76,9 @@ const unsigned int papabench_tick_cycles = PAPABENCH_TICK_CYCLES;
 static volatile uint32_t harness_ticks;
 static uint64_t harness_timecmp;
 
+/* Dispatcher of each interrupt (mcause number), for harness_irq */
+static papabench_fn_t harness_dispatch[ 32 ];
+
 
 #if PAPABENCH_MEASURE
 struct harness_stat {
@@ -101,7 +107,8 @@ static struct harness_stat *harness_open;
 
 /* Cycles spent in the timer ISR body, subtracted from task samples */
 static volatile uint32_t harness_isr_cycles;
-/* Trap entry/exit cycles of one interrupt, outside the wrapper's reads */
+/* Trap entry/exit cycles of one interrupt, outside the wrapper's reads:
+   printed as trap_overhead, not subtracted from the samples */
 static uint32_t harness_trap_cycles;
 #endif
 
@@ -111,6 +118,15 @@ static inline uint32_t harness_mcycle( void )
   uint32_t v;
 
   asm volatile( "csrr %0, mcycle" : "=r"( v ) : : "memory" );
+  return v;
+}
+
+
+static inline uint32_t harness_mcause( void )
+{
+  uint32_t v;
+
+  asm volatile( "csrr %0, mcause" : "=r"( v ) );
   return v;
 }
 
@@ -304,55 +320,49 @@ static void harness_isr_calib_fn( void )
 
 
 /*
-  Every Ibex interrupt, the scheduler tick included, enters through one of
-  these wrappers, all compiled to the same code: read mcycle, call the
-  dispatcher, synchronise the models, read mcycle. The cycles outside the two
-  reads (trap entry, register save, register restore, mret) are the same for
-  all of them: harness_trap_cycles, measured at start-up by harness_trap_calib()
-  and added with the body to harness_isr_cycles, so that task samples exclude
-  the whole interrupt. Dispatchers must not be inlined (noinline or another
-  translation unit), or the wrappers would differ.
+  Every Ibex interrupt, the scheduler tick included, enters through this one
+  wrapper: read mcycle, call the dispatcher of the interrupt taken (mcause),
+  synchronise the models, read mcycle. Only the body between the two reads
+  is added to harness_isr_cycles. The cycles outside them (trap entry,
+  register save, register restore, mret) stay in the task sample they hit:
+  subtracting a calibrated constant (harness_trap_cycles) instead gave
+  samples below the task's real cost, even negative, because the real trap
+  cost depends on where the interrupt lands.
 */
+static void __attribute__( ( interrupt ) ) harness_irq( void )
+{
 #if PAPABENCH_MEASURE
-#define HARNESS_IRQ_WRAPPER( name, dispatch )                            \
-  static void __attribute__( ( interrupt ) ) name( void )                \
-  {                                                                     \
-    uint32_t t0 = harness_mcycle();                                     \
-    dispatch();                                                         \
-    papabench_periph_poll();                                            \
-    harness_isr_cycles += harness_mcycle() - t0 + harness_trap_cycles;  \
-  }
-#else
-#define HARNESS_IRQ_WRAPPER( name, dispatch )                            \
-  static void __attribute__( ( interrupt ) ) name( void )                \
-  {                                                                     \
-    dispatch();                                                         \
-    papabench_periph_poll();                                            \
-  }
+  uint32_t t0 = harness_mcycle();
 #endif
 
-HARNESS_IRQ_WRAPPER( harness_timer_isr, harness_tick )
-HARNESS_IRQ_WRAPPER( harness_irq_timer_a, papabench_irq_timer_a )
-HARNESS_IRQ_WRAPPER( harness_irq_timer_b, papabench_irq_timer_b )
-HARNESS_IRQ_WRAPPER( harness_irq_timer_c, papabench_irq_timer_c )
-HARNESS_IRQ_WRAPPER( harness_irq_uart, papabench_irq_uart )
-HARNESS_IRQ_WRAPPER( harness_irq_gpio, papabench_irq_gpio )
+  harness_dispatch[ harness_mcause() & 0x1F ]();
+  papabench_periph_poll();
+#if PAPABENCH_MEASURE
+  harness_isr_cycles += harness_mcycle() - t0;
+#endif
+}
+
+
+static void harness_install( unsigned int irq, papabench_fn_t dispatch )
+{
+  harness_dispatch[ irq ] = dispatch;
+  install_exception_handler( irq, harness_irq );
+}
 
 
 #if PAPABENCH_MEASURE
-/* Start-up measurement of harness_trap_cycles: a TimerC interrupt hits a
-   loop that reads mcycle back to back. The iteration it lands in takes the
-   loop's normal time + trap + wrapper body; the body is known
+/* Start-up measurement of harness_trap_cycles: a machine-timer interrupt
+   hits a loop that reads mcycle back to back. The iteration it lands in
+   takes the loop's normal time + trap + wrapper body; the body is known
    (harness_isr_cycles), so trap = gap - normal - body. Minimum over a few
-   trials, so that it is never over-subtracted. Runs before the models are
-   set up; TimerC is disarmed by the dispatcher. */
+   trials. Reported only (trap_overhead): it tells how much an interrupt
+   adds to the sample it hits. Runs before the tick and the models are set
+   up; the dispatcher disarms the timer. */
 static void __attribute__( ( noinline ) ) harness_calib_dispatch( void )
 {
-  IBEX_REG( IBEX_TIMER_C + IBEX_MTIMECMP ) = 0xFFFFFFFFu;
-  IBEX_REG( IBEX_TIMER_C + IBEX_MTIMECMPH ) = 0xFFFFFFFFu;
+  IBEX_REG( IBEX_TIMER + IBEX_MTIMECMP ) = 0xFFFFFFFFu;
+  IBEX_REG( IBEX_TIMER + IBEX_MTIMECMPH ) = 0xFFFFFFFFu;
 }
-
-HARNESS_IRQ_WRAPPER( harness_irq_calib, harness_calib_dispatch )
 
 
 static void harness_trap_calib( void )
@@ -361,18 +371,18 @@ static void harness_trap_calib( void )
   unsigned int trial;
 
   harness_trap_cycles = 0;
-  install_exception_handler( IBEX_IRQ_TIMER_C, harness_irq_calib );
-  enable_interrupts( 1u << IBEX_IRQ_TIMER_C );
+  harness_install( TIMER_IRQ_NUM, harness_calib_dispatch );
+  enable_interrupts( TIMER_IRQ );
 
   for ( trial = 0; trial < 8; trial++ ) {
     uint32_t isr0, body, prev, cur, d, dmin = 0xFFFFFFFF, dmax = 0;
-    uint32_t now = IBEX_REG( IBEX_TIMER_C + IBEX_MTIME );
+    uint32_t now = IBEX_REG( IBEX_TIMER + IBEX_MTIME );
     int extra = 2;
 
-    IBEX_REG( IBEX_TIMER_C + IBEX_MTIMECMP ) = 0xFFFFFFFFu;
-    IBEX_REG( IBEX_TIMER_C + IBEX_MTIMECMPH ) =
-      IBEX_REG( IBEX_TIMER_C + IBEX_MTIMEH );
-    IBEX_REG( IBEX_TIMER_C + IBEX_MTIMECMP ) = now + 300;
+    IBEX_REG( IBEX_TIMER + IBEX_MTIMECMP ) = 0xFFFFFFFFu;
+    IBEX_REG( IBEX_TIMER + IBEX_MTIMECMPH ) =
+      IBEX_REG( IBEX_TIMER + IBEX_MTIMEH );
+    IBEX_REG( IBEX_TIMER + IBEX_MTIMECMP ) = now + 300;
     isr0 = harness_isr_cycles;
     set_global_interrupt_enable( 1 );
     prev = harness_mcycle();
@@ -391,7 +401,7 @@ static void harness_trap_calib( void )
       best = dmax - dmin - body;
   }
 
-  disable_interrupts( 1u << IBEX_IRQ_TIMER_C );
+  disable_interrupts( TIMER_IRQ );
   harness_isr_cycles = 0;
   harness_trap_cycles = best;
 }
@@ -402,9 +412,7 @@ static void harness_trap_calib( void )
 
 int main( void )
 {
-#if PAPABENCH_MEASURE
   unsigned int t;
-#endif
 
   pcount_enable( 0 );
   pcount_reset();
@@ -427,6 +435,15 @@ int main( void )
        papabench_nisrs > PAPABENCH_MAX_ISRS ) {
     puts( "ERROR,too many tasks or ISRs\n" );
     return 1;
+  }
+  for ( t = 0; t < papabench_nirqs; t++ ) {
+    unsigned int irq = papabench_irqs[ t ].irq;
+
+    if ( irq >= 32 || irq == TIMER_IRQ_NUM || harness_dispatch[ irq ] ) {
+      puts( "ERROR,bad or duplicate interrupt in papabench_irqs\n" );
+      return 1;
+    }
+    harness_dispatch[ irq ] = papabench_irqs[ t ].dispatch;
   }
   if ( papabench_check() ) {
     puts( "ERROR,PAPABENCH_TIFR_ADDR/PAPABENCH_TICK_BIT do not match the device\n" );
@@ -458,20 +475,18 @@ int main( void )
   harness_trap_calib();
 #endif
 
-  /* Peripheral models: real peripherals set up, model interrupts installed.
-     TimerA/B/C and the UART only interrupt once a model arms them; the GPIO
-     line is enabled by the model when the upstream code enables its AVR
-     interrupt. */
+  /* Peripheral models: real peripherals set up, the model's interrupts
+     installed. Timers and the UART only interrupt once the model arms them;
+     GPIO lines are enabled by the model when the upstream code enables its
+     AVR interrupt. */
   papabench_periph_init();
-  install_exception_handler( IBEX_IRQ_TIMER_A, harness_irq_timer_a );
-  install_exception_handler( IBEX_IRQ_TIMER_B, harness_irq_timer_b );
-  install_exception_handler( IBEX_IRQ_TIMER_C, harness_irq_timer_c );
-  install_exception_handler( IBEX_IRQ_UART, harness_irq_uart );
-  install_exception_handler( IBEX_IRQ_GPIO, harness_irq_gpio );
-  enable_interrupts( ( 1u << IBEX_IRQ_TIMER_A ) | ( 1u << IBEX_IRQ_TIMER_B ) |
-                     ( 1u << IBEX_IRQ_TIMER_C ) | ( 1u << IBEX_IRQ_UART ) );
+  for ( t = 0; t < papabench_nirqs; t++ ) {
+    harness_install( papabench_irqs[ t ].irq, papabench_irqs[ t ].dispatch );
+    if ( papabench_irqs[ t ].enable )
+      enable_interrupts( 1u << papabench_irqs[ t ].irq );
+  }
 
-  install_exception_handler( TIMER_IRQ_NUM, harness_timer_isr );
+  harness_install( TIMER_IRQ_NUM, harness_tick );
   harness_timecmp = timer_read() + PAPABENCH_TICK_CYCLES;
   timecmp_update( harness_timecmp );
   enable_interrupts( TIMER_IRQ );

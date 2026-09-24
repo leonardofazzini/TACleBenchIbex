@@ -4,7 +4,7 @@
   AVR source              Ibex resource               upstream ISR
   Timer1 compare A        TimerA channel 0            __vector_6  servo
   SPI slave (autopilot)   TimerC channel 0            __vector_10 SPI
-  UART transmit complete  TimerC channel 2 + UART TX  __vector_13
+  UART transmit complete  TimerE channel 0            __vector_13
   ADC conversion          TimerB channel 0            __vector_14
   Timer1 input capture    GPIO gp_i[0], IRQ 17        __vector_5  radio PPM
 
@@ -19,9 +19,15 @@
   master byte time + the master's OCR1A delay. Its commands come from
   fbw_spi_frame() (deterministic scenario).
 
+  UART: the servos are only on the PWM. The upstream code still writes its
+  boot string and the servo_transmit() frames to the AVR UART, so the UART
+  is virtual: bytes are dropped, but the transmitter takes one byte time
+  (38400 baud) per byte on TimerE and the transmit-complete ISR runs from
+  its interrupt, exactly as with a real UART.
+
   The radio PPM train comes from the simulation environment
-  (hw/rtl/papabench_env.sv) on gp_i[0]; the input-capture value is TimerA's
-  AVR time when the interrupt is taken.
+  (hw/rtl/papabench_env.sv) on gp_i[0]; the input-capture value is the AVR
+  time when the interrupt is taken.
 */
 
 #include <arch/io.h>
@@ -133,7 +139,7 @@ static void fbw_adc_sync( void )
 }
 
 
-/* --------------------------------------------------------------- UART --- */
+/* ------------------------------------------------------- virtual UART --- */
 
 static unsigned char fbw_tx_busy;
 
@@ -147,15 +153,13 @@ static void fbw_uart_event( void )
 
 
 /* A byte is written to UDR exactly when uart_transmit() or the ISR leaves
-   TXCIE set with the transmitter idle */
+   TXCIE set with the transmitter idle; it is dropped after its byte time */
 static void fbw_uart_sync( void )
 {
   if ( !( UCSRB & _BV( TXCIE ) ) || fbw_tx_busy )
     return;
-  if ( !( IBEX_REG( IBEX_UART + IBEX_UART_STATUS ) & IBEX_UART_TX_FULL ) )
-    IBEX_REG( IBEX_UART + IBEX_UART_TX ) = UDR;
   fbw_tx_busy = 1;
-  pb_arm( &pb_timer_c, 2, pb_now() + FBW_UART_BYTE_CYCLES );
+  pb_arm( &pb_timer_e, 0, pb_now() + FBW_UART_BYTE_CYCLES );
 }
 
 
@@ -222,41 +226,45 @@ static void fbw_spi_event( void )
 
 /* ---------------------------------------------------------------- PPM --- */
 
-static unsigned char fbw_gpio_on;
+static unsigned char fbw_ppm_on;
 
 
-void papabench_irq_gpio( void )
+static void fbw_ppm_irq( void )
 {
-  pb_gpio_ack();
+  pb_gpo_toggle( PB_GPO_PPM_ACK );
   ICR1 = PB_TCNT1( fbw_counters() );
   if ( TIMSK & _BV( TICIE1 ) )
     papabench_isr_run( FBW_ISR_PPM, __vector_5 );
 }
 
 
-static void fbw_gpio_sync( void )
+static void fbw_ppm_sync( void )
 {
   unsigned char on = ( TIMSK & _BV( TICIE1 ) ) != 0;
 
-  if ( on == fbw_gpio_on )
+  if ( on == fbw_ppm_on )
     return;
-  fbw_gpio_on = on;
+  fbw_ppm_on = on;
   if ( on )
-    ibex_irq_enable( IBEX_IRQ_GPIO );
+    ibex_irq_enable( IBEX_IRQ_GPIO0 );
   else
-    ibex_irq_disable( IBEX_IRQ_GPIO );
-}
-
-
-/* The FBW does not receive on the UART: drain it */
-void papabench_irq_uart( void )
-{
-  while ( !( IBEX_REG( IBEX_UART + IBEX_UART_STATUS ) & IBEX_UART_RX_EMPTY ) )
-    ( void ) IBEX_REG( IBEX_UART + IBEX_UART_RX );
+    ibex_irq_disable( IBEX_IRQ_GPIO0 );
 }
 
 
 /* --------------------------------------------------------------- init --- */
+
+const struct papabench_irq papabench_irqs[] = {
+  { IBEX_IRQ_TIMER_A, papabench_irq_timer_a, 1 },
+  { IBEX_IRQ_TIMER_B, papabench_irq_timer_b, 1 },
+  { IBEX_IRQ_TIMER_C, papabench_irq_timer_c, 1 },
+  { IBEX_IRQ_TIMER_E, papabench_irq_timer_e, 1 },
+  { IBEX_IRQ_GPIO0, fbw_ppm_irq, 0 },
+};
+
+const unsigned int papabench_nirqs =
+  sizeof( papabench_irqs ) / sizeof( papabench_irqs[ 0 ] );
+
 
 void papabench_periph_init( void )
 {
@@ -265,7 +273,7 @@ void papabench_periph_init( void )
   pb_timer_a.fn[ 0 ] = fbw_oc1a_event;
   pb_timer_b.fn[ 0 ] = fbw_adc_event;
   pb_timer_c.fn[ 0 ] = fbw_spi_event;
-  pb_timer_c.fn[ 2 ] = fbw_uart_event;
+  pb_timer_e.fn[ 0 ] = fbw_uart_event;
 
   for ( i = 0; i < FBW_4017_CHANNELS; i++ ) {
     IBEX_REG( IBEX_PWM_PERIOD( i ) ) = FBW_SERVO_PERIOD - 1;
@@ -277,7 +285,7 @@ void papabench_periph_init( void )
   fbw_spi_frame_time = pb_now() + papabench_tick_cycles;
   pb_arm( &pb_timer_c, 0, fbw_spi_frame_time );
 
-  pb_gpo_write( PB_GPO_MODE_MASK, PB_ENV_FBW << PB_GPO_MODE_SHIFT );
+  pb_gpo_write( PB_GPO_ENV_FBW, PB_GPO_ENV_FBW );
 }
 
 
@@ -286,6 +294,6 @@ void papabench_periph_poll( void )
   pb_oc_sync( &fbw_oc, TIMSK & _BV( OCIE1A ), OCR1A );
   fbw_adc_sync();
   fbw_uart_sync();
-  fbw_gpio_sync();
+  fbw_ppm_sync();
   pb_avr_snapshot_done();
 }

@@ -12,8 +12,9 @@
 #                            the Secure-Ibex sources + hw/patches (done by 'run'
 #                            if missing)
 #   make PROG=fbw vmem       also produce a .vmem image (not needed by Verilator)
-#   make hwtest              smoke test of the SoC patches (TimerC IRQ 20,
-#                            20-bit PWM) on the simulator, with a waveform
+#   make hwtest              smoke test of the SoC patches (TimerC/D/E IRQ
+#                            20/22/23, gp_i[1] IRQ 21, 20-bit PWM, pwm.log)
+#                            on the simulator, with a waveform
 #
 # Each program runs its own upstream scheduler; its time base is the Ibex
 # machine timer (0x80000000, IRQ 7), one tick every TICK_CYCLES cycles.
@@ -327,7 +328,8 @@ $(SIM_DEFAULT):
 
 # Smoke test of the SoC patches (hw/test/hw_smoke.c). Runs with -t: the PWM
 # cannot be read back, so hw/test/check_pwm.sh measures its output on the
-# waveform (fst2vcd). Independent of PROG.
+# waveform (fst2vcd), and pwm.log (PWM monitor) must hold the same pulse.
+# Independent of PROG.
 HWT := $(HERE)/build/hwtest
 HWT_SRCS := $(HERE)/hw/test/hw_smoke.c \
   $(IBEX_COMMON)/reference_system_common.c $(IBEX_COMMON)/timer.c \
@@ -339,6 +341,9 @@ hwtest: $(HWT)/hw_smoke.elf $(SIM)
 	  status=$$?; cat reference_system.log; [ $$status -eq 0 ] || exit $$status
 	grep -q "^hw_smoke: PASS" $(HWT)/reference_system.log
 	$(HERE)/hw/test/check_pwm.sh $(HWT)/sim.fst
+	awk '$$2 == 0 && $$3 == 75000 { n++ } END { exit n < 2 }' $(HWT)/pwm.log \
+	  && echo "PASS pwm.log: channel 0 pulses of 75000 cycles" \
+	  || { echo "FAIL pwm.log: channel 0 pulses of 75000 cycles"; exit 1; }
 
 $(HWT)/hw_smoke.elf: $(HWT_SRCS) $(LINKER_SCRIPT)
 	@mkdir -p $(dir $@)
@@ -346,7 +351,8 @@ $(HWT)/hw_smoke.elf: $(HWT_SRCS) $(LINKER_SCRIPT)
 	  -Wl,--gc-sections -T $(LINKER_SCRIPT) $(HWT_SRCS) -o $@ -lgcc
 
 # The simulator writes in the current directory: sim.log (stdout),
-# reference_system.log (SimCtrl output = results), uart0.log, pcount CSV
+# reference_system.log (SimCtrl output = results), uart0.log (UART TX, unused
+# by both programs), pwm.log (PWM pulses: FBW servos), pcount CSV
 run: all $(SIM)
 	cd $(BUILD) && $(SIM) --meminit=ram,$(ELF) > sim.log 2>&1; \
 	  status=$$?; cat reference_system.log; exit $$status

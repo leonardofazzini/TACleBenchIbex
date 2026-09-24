@@ -34,10 +34,12 @@ filesets:
       - lowrisc:dv_dpi_sv:uartdpi
       - lowrisc:dv_dpi_c:uartdpi
     files:
-      # Deterministic environment (hw/rtl/) and its generated stimulus
-      # tables (hw/stimulus/gen_stimulus.py), staged by 'make sim'
+      # Deterministic environment and PWM monitor (hw/rtl/) and the
+      # generated stimulus tables (hw/stimulus/gen_stimulus.py), staged by
+      # 'make sim'
       - rtl/papabench/papabench_stim.svh: { is_include_file: true }
       - rtl/papabench/papabench_env.sv
+      - rtl/papabench/papabench_pwm_monitor.sv
       - rtl/top_simulation/reference_system.sv
     file_type: systemVerilogSource
 

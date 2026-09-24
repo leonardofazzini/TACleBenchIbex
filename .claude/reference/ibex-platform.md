@@ -11,8 +11,9 @@ From `sw/Standard_Only_SW/Standard_Tests/common/reference_system_regs.h` and `RE
 | RAM | `0x00100000` | 128 KiB in HW; the stock `link.ld` uses 56 KiB code/data + 8 KiB stack |
 | SimCtrl | `0x00020000` | Verilator only; `SIM_CTRL_OUT` (+0x0) prints a char, `SIM_CTRL_CTRL` (+0x8) halts |
 | Timer | `0x80000000` | `mtime`/`mtimecmp`, IRQ 7; drives the PapaBench schedulers |
-| TimerA / TimerB | `0x80010000` / `0x80020000` | fast IRQ, `mip` bits 18/19; present in the simulator built from the submodule (`make sim`), unused by the harness |
-| TimerC | `0x80030000` | **our patch** (`hw/patches/0001-soc-timer-c.patch`); fast IRQ 20 (`mip` bit 20); not in `reference_system_regs.h` |
+| TimerA / TimerB | `0x80010000` / `0x80020000` | fast IRQ, `mip` bits 18/19; FBW servo compare / ADC (both programs) |
+| TimerC | `0x80030000` | **our patch** (`hw/patches/0001-soc-timer-c.patch`); fast IRQ 20 (`mip` bit 20); not in `reference_system_regs.h`; SPI link (both) |
+| TimerD / TimerE | `0x80040000` / `0x80050000` | **our patch** (`hw/patches/0004-soc-timers-d-e-gpio-irq.patch`); fast IRQ 22/23; Autopilot `link_fbw` compare / FBW virtual UART |
 | UART0 | `0x80001000` | IRQ 16 |
 | GPIO | `0x80002000` | |
 | PWM | `0x80003000` | 12 channels, no IRQ, no read-back; channel `i`: pulse width at `+8i`, period (counter max) at `+8i+4`; high for `width` cycles out of `max+1`. Counter is **20 bits** in our model (`hw/patches/0002-soc-pwm-ctr-size.patch`; 8 upstream) |
@@ -48,7 +49,7 @@ Run an ELF:
 
 `-t` dumps a waveform. Requires Verilator 5.014 or 5.017 and the `.venv` with FuseSoC (see the README).
 
-The simulator writes into its **current directory** (verified 2026-09-23): `reference_system.log` = everything written to SimCtrl (`putchar`/`puts` of `common/`, so the harness results); `uart0.log` = UART0 output (also exposed on a `/dev/pts/N`); `reference_system_pcount.csv` = Ibex performance counters; stdout = banner, `Executed cycles`, performance counter summary. A write of 1 to `SIM_CTRL_CTRL` (`sim_halt()`, or `crt0.S` after `main` returns) ends the run.
+The simulator writes into its **current directory** (verified 2026-09-23): `reference_system.log` = everything written to SimCtrl (`putchar`/`puts` of `common/`, so the harness results); `uart0.log` = UART0 output (also exposed on a `/dev/pts/N`; empty for PapaBench, no program transmits); `pwm.log` = PWM pulses (our monitor, patch 0005); `reference_system_pcount.csv` = Ibex performance counters; stdout = banner, `Executed cycles`, performance counter summary. A write of 1 to `SIM_CTRL_CTRL` (`sim_halt()`, or `crt0.S` after `main` returns) ends the run.
 
 This project builds the model from the submodule sources **plus our SoC patches** (see "SoC patches" below) with `fusesoc --cores-root=<repo>/Secure-Ibex --cores-root=papabench_ibex/build/sim/hw run --target=sim_ibex --setup --build --build-root=papabench_ibex/build/sim papabench:soc:reference_system --verilator_options=-Wno-fatal` (`make sim`), so the output is `papabench_ibex/build/sim/sim_ibex-verilator/Vreference_system` and the submodule stays clean (verified with `git -C Secure-Ibex status`, 2026-09-23). The FuseSoC venv must be activated: the pre-build `util/check_tool_requirements.py` runs `pip3 show edalize` from `PATH` and fails otherwise.
 
@@ -60,10 +61,10 @@ The model built from the submodule (commit `b04c064`) contains `u_timer`, TimerA
 
 ## Interrupt lines (verified in `rtl/system/reference_system_core.sv`, 2026-09-23)
 
-`irq_fast_i` = `{10'b0, timer_c_irq, timer_b_irq, timer_a_irq, gp_i[0], uart_irq}` in our patched model, i.e. IRQ 16 UART, 17 `gp_i[0]`, 18 TimerA, 19 TimerB, 20 TimerC (patch); 21–30 tied to 0; timer on IRQ 7; software/external/NMI tied to 0.
+`irq_fast_i` = `{7'b0, timer_e_irq, timer_d_irq, gp_i[1], timer_c_irq, timer_b_irq, timer_a_irq, gp_i[0], uart_irq}` in our patched model, i.e. IRQ 16 UART, 17 `gp_i[0]`, 18 TimerA, 19 TimerB, 20 TimerC (patch 0001), 21 `gp_i[1]`, 22 TimerD, 23 TimerE (patch 0004); 24–30 tied to 0; timer on IRQ 7; software/external/NMI tied to 0.
 
 - UART IRQ = RX FIFO not empty (no TX interrupt); reading RX drains it. Baud fixed at 115200 (50 MHz).
-- `gp_i[0]` reaches the core **directly and level-sensitive**; the GPIO has no interrupt or acknowledge register.
+- `gp_i[0]` and `gp_i[1]` reach the core **directly and level-sensitive**; the GPIO has no interrupt or acknowledge register.
 - In the upstream Verilator top (`rtl/top_simulation/reference_system.sv`) `gp_i` is undriven and `uart_rx` comes from `uartdpi` (a host pty, not deterministic). Our patch 0003 drives both from `papabench_env` instead (see SoC patches); `uartdpi` still receives the UART TX (`uart0.log`).
 - No SPI or ADC is instantiated in the SoC (`spi_top.sv` is compiled but unused).
 
@@ -82,10 +83,12 @@ The top module keeps the name `reference_system` and the instance `u_reference_s
 | `0001-soc-timer-c.patch` | TimerC `u_timer_c` at `0x80030000`, `irq_fast_i[4]` (IRQ 20); CV32E40P branch `core_irq[20]` too; `NrDevices` +1 |
 | `0002-soc-pwm-ctr-size.patch` | `PwmCtrSize` becomes a `reference_system_core` parameter (default 8); the simulation top passes 20 |
 | `0003-sim-top-papabench-env.patch` | simulation top instantiates `papabench_env` (`hw/rtl/papabench_env.sv`): `gp_i` and `uart_rx` come from it, `gp_o` feeds it; `uartdpi`'s TX output (host → RX) is left unconnected |
+| `0004-soc-timers-d-e-gpio-irq.patch` | TimerD `u_timer_d` at `0x80040000` (`irq_fast_i[6]`, IRQ 22), TimerE `u_timer_e` at `0x80050000` (`irq_fast_i[7]`, IRQ 23), `gp_i[1]` on `irq_fast_i[5]` (IRQ 21); CV32E40P `core_irq[21..23]` too; `NrDevices` +2 |
+| `0005-sim-top-pwm-monitor.patch` | simulation top instantiates `papabench_pwm_monitor` (`hw/rtl/papabench_pwm_monitor.sv`) on `pwm_o`: one `pwm.log` line per pulse (`<rise> <channel> <width>`, cycles since reset) |
 
 `make sim` also copies `hw/rtl/*.sv` to `build/sim/hw/rtl/papabench/` and generates `papabench_stim.svh` there with `hw/stimulus/gen_stimulus.py`; both are listed in `hw/papabench_soc.core` (`files_simulation`). What the environment plays: `.claude/reference/port-harness.md` → Simulation environment.
 
-Verified 2026-09-23 (patches 0001–0002, before the peripheral models existed): FBW and Autopilot `reference_system.log` and `Executed cycles` identical on the unpatched and patched models; with 0003 and the models, two consecutive runs of each program are cycle-identical; `make hwtest` passes (TimerC: 4/4 periodic IRQs, never early, max latency 18 cycles; TimerA/B quiet; `pwm_o[0]` 75000 high / 100001 period). Note the PWM start-up: the counter starts when the period register is written, so the first pulse after programming is 2 cycles short.
+Verified 2026-09-23 (patches 0001–0002, before the peripheral models existed): FBW and Autopilot `reference_system.log` and `Executed cycles` identical on the unpatched and patched models; with 0003 and the models, two consecutive runs of each program are cycle-identical; `make hwtest` passes (TimerC: 4/4 periodic IRQs, never early, max latency 18 cycles; TimerA/B quiet; `pwm_o[0]` 75000 high / 100001 period). 2026-09-24 (patches 0004–0005): `make hwtest` passes — TimerC/D/E 4/4 periodic IRQs each on its own line, never early, no other line (17–23) raised, max latency 48 cycles (heavier test ISR); modem clock → IRQ 21 once per edge with the `gp_o[6]` ack, IRQ 17 quiet; `pwm.log` has the 75000-cycle pulses. Note the PWM start-up: the counter starts when the period register is written, so the first pulse after programming is 2 cycles short.
 
 To add a patch: copy the file(s) from the submodule into two trees `a/` and `b/`, edit `b/`, `diff -u`, rewrite the headers to `--- a/<path>` / `+++ b/<path>`, save as `hw/patches/NNNN-<name>.patch`; add any new file to `SOC_FILES` and to the `.core` file.
 
