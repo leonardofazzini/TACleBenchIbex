@@ -33,7 +33,7 @@ Linker script: `papabench_ibex/link.ld` (112 KiB code+data, 16 KiB stack = the w
 - `harness_timer_isr()` (`__attribute__((interrupt))`): `timecmp += TICK_CYCLES` (from the previous compare, so no drift), `timecmp_update()`, `papabench_tick_pending = 1`, count the tick, add its own body cycles to `harness_isr_cycles`.
 - `include/arch/sfr_defs.h`: `bit_is_set( sfr, bit )` is `papabench_tick_take()` (test-and-clear of `papabench_tick_pending`, `runtime.c`) when `_SFR_ADDR( sfr ) == PAPABENCH_TIFR_ADDR && bit == PAPABENCH_TICK_BIT`, a plain memory test otherwise. The address test folds at compile time (verified in the FBW disassembly: one call to `papabench_tick_take`, inside the inlined `timer_periodic()`). The upstream "clear" write lands in `papabench_sfr[]` and is ignored.
 - `PAPABENCH_TIFR_ADDR` comes from the Makefile (FBW ATmega8 `0x58`, Autopilot ATmega128 `0x56`), `PAPABENCH_TICK_BIT=6`; `papabench_check()` in the glue verifies both against the device header at run time.
-- Resulting activation pattern over 61 ticks (verified): FBW loops `fbw_schedule()` continuously (~370 iterations per tick at `-Os`); Autopilot `periodic_task()` once per tick → navigation/altitude/climb every 15 ticks (4), `stabilisation_task`/`link_fbw_send` every 3 (20), reporting every 6 (10). The Autopilot first consumes 30 ticks in `mainloop.c`'s init wait (`papabench_startup_ticks`).
+- Resulting activation pattern over 61 ticks (verified): FBW runs `fbw_schedule()` once per tick (our patch; upstream looped it continuously, ~370 iterations per tick at `-Os`) → 60 activations per task, `servo_transmit` every 3 (19); Autopilot `periodic_task()` once per tick → navigation/altitude/climb every 15 ticks (4), `stabilisation_task`/`link_fbw_send` every 3 (20), reporting every 6 (10). The Autopilot first consumes 30 ticks in `mainloop.c`'s init wait (`papabench_startup_ticks`).
 
 ## Per-task measurement: selective `-finstrument-functions`
 
@@ -78,6 +78,7 @@ Instantiated in the Verilator top; drives `gp_i` and `uart_rx` from the clock an
 ## Upstream compile problems (unchanged from the first port)
 
 - `autopilot/main.c`: `ModeUpdate(...); else` → `patches/autopilot_main_modeupdate.patch`, applied to `build/autopilot/patched/main.c`.
+- `fly_by_wire/main.c`: `servo_transmit` unreachable and `fbw_schedule()` every loop iteration → `patches/fbw_main_schedule.patch`, applied to `build/fbw/patched/main.c` (Makefile `MAIN_SRC`/`MAIN_PATCH`).
 - `ad7714.c`, `gps_sirf.c` → not built. `ck_a`/`ck_b` → `-fcommon`. Non-static `inline` → `-fgnu89-inline`.
 - Upstream `main()` of FBW (`fly_by_wire/main.c`) and Autopilot (`autopilot/mainloop.c`) → `-Dmain=papabench_upstream_main` on that object (plain and instrumented).
 - No libc → `runtime.c` provides `memcpy`/`memset`; `-lgcc` for soft-float and 64-bit division.

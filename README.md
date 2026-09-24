@@ -82,6 +82,7 @@ Run from `papabench_ibex/`:
 | `make PROG=fbw` / `make PROG=autopilot` | Build `build/<prog>/<prog>.elf` |
 | `make all-progs` | Build both programs |
 | `make PROG=<prog> run` | Build, simulate and print `build/<prog>/reference_system.log` |
+| `make PROG=<prog> MEASURE=0 run` | Same scenario with no measurement at all (no instrumentation hooks, no calibration, no results): the program just runs for `TICKS` ticks. Built in `build/<prog>-nomeasure/`; the output is the header line and `END`, the UART output is in `uart0.log` |
 | `make sim` | (Re)build the Verilator model from `Secure-Ibex/` + `hw/patches/` (FuseSoC target `sim_ibex`) into `build/sim/` |
 | `make hwtest` | Smoke test of the SoC patches (TimerC IRQ 20, 20-bit PWM) on the simulator |
 | `make PROG=<prog> disassemble` | Write `build/<prog>/<prog>.dis` |
@@ -95,6 +96,7 @@ Run from `papabench_ibex/`:
 | `TICKS` | `61` | Scheduler ticks to simulate before reporting (about 1 s of flight). The Autopilot adds its 30 start-up ticks. |
 | `TICK_CYCLES` | `819200` | Timer period in cycles: the AVR Timer2 overflow period, 16.384 ms, at 50 MHz |
 | `OPT` | `-Os` | Optimisation level |
+| `MEASURE` | `1` | `0` builds the program without any measurement (plain objects, harness without timing) in `build/<prog>-nomeasure/` |
 | `SIM` | `build/sim/sim_ibex-verilator/Vreference_system` | Simulator to use |
 | `FUSESOC` | `fusesoc` | FuseSoC executable |
 
@@ -140,11 +142,11 @@ identical results, cycle for cycle.
 
 | Program | Task | Activations | Cycles min / max / avg |
 |---|---|---|---|
-| FBW | `check_failsafe_task` | 18917 | 34 / 2696 / 1632 |
-| FBW | `check_mega128_values_task` | 18918 | 39 / 2969 / 45 |
-| FBW | `send_data_to_autopilot_task` | 18918 | 33 / 1599 / 39 |
-| FBW | `servo_transmit` | 0 | — (see Known limitations) |
-| FBW | `test_ppm_task` | 18918 | 46 / 5684 / 57 |
+| FBW | `check_failsafe_task` | 60 | invalid: one negative sample (see Known limitations) |
+| FBW | `check_mega128_values_task` | 60 | 38 / 2882 / 278 |
+| FBW | `send_data_to_autopilot_task` | 60 | 22 / 1258 / 440 |
+| FBW | `servo_transmit` | 19 | 669 / 727 / 700 |
+| FBW | `test_ppm_task` | 60 | 15 / 5608 / 2961 |
 | Autopilot | `altitude_control_task` | 4 | 38 (take-off block, see Known limitations) |
 | Autopilot | `climb_control_task` | 4 | 60 |
 | Autopilot | `link_fbw_send` | 20 | 108 / 195 / 113 |
@@ -157,10 +159,10 @@ identical results, cycle for cycle.
 | Program | Interrupt handler | Calls | Cycles min / max / avg |
 |---|---|---|---|
 | FBW | `radio_ppm(__vector_5)` | 400 | 41 / 64 / 54 |
-| FBW | `servo(__vector_6)` | 701 | 53 / 65 / 54 |
+| FBW | `servo(__vector_6)` | 673 | 53 / 65 / 54 |
 | FBW | `spi(__vector_10)` | 461 | 92 / 157 / 153 |
-| FBW | `uart_tx(__vector_13)` | 63 | 21 / 34 / 33 |
-| FBW | `adc(__vector_14)` | 8821 | 49 / 71 / 56 |
+| FBW | `uart_tx(__vector_13)` | 500 | 21 / 34 / 33 |
+| FBW | `adc(__vector_14)` | 8795 | 49 / 71 / 56 |
 | Autopilot | `modem(__vector_5)` | 4129 | 27 / 73 / 42 |
 | Autopilot | `link_fbw_oc1a(__vector_12)` | 460 | 113 / 136 / 134 |
 | Autopilot | `spi(__vector_17)` | 460 | 47 |
@@ -220,6 +222,21 @@ What was done
   - `autopilot/main.c` has a syntax error (`ModeUpdate(...); else`). It is
     fixed by `papabench_ibex/patches/autopilot_main_modeupdate.patch`, applied
     to a copy in the build directory.
+  - FBW's `main()` has two scheduling defects, both fixed by
+    `papabench_ibex/patches/fbw_main_schedule.patch`:
+    - It calls `fbw_schedule()` on every loop iteration (hundreds of times
+      per tick), but `fbw_schedule()` counts the radio and Autopilot
+      timeouts in ticks (`STALLED_TIME 30 // 500ms with a 60Hz timer`).
+      Radio and Autopilot were declared lost within a fraction of a tick,
+      so `check_failsafe_task` kept the servos at their failsafe (neutral)
+      positions almost all the time. The patch calls `fbw_schedule()` once
+      per tick, as the upstream single-program build (`PAPABENCH_SINGLE`)
+      does. The FBW tasks now run 60 times in 61 ticks.
+    - `servo_transmit` was unreachable: `main()` reset `_20Hz` before
+      `fbw_schedule()` could see it reach 3. The patch moves the reset
+      into `fbw_schedule()`, right before the call, so `servo_transmit`
+      runs once every 3 ticks (about 20 Hz) and sends its 23-byte servo
+      frame (10 pulse widths) on the UART.
   - `ad7714.c` and `gps_sirf.c` are unused and do not compile, so they are
     not built.
 - **Flow facts.** The loop-bound and entry-point pragmas (WCET flow facts)
@@ -321,7 +338,7 @@ run from real Ibex interrupts:
 | Timer1 compare | servo (`__vector_6`) | FBW link byte pacing (`__vector_12`) | TimerA, IRQ 18 |
 | ADC | `__vector_14` | `__vector_21` (IR sensors) | TimerB, IRQ 19 |
 | SPI | slave (`__vector_10`) | master (`__vector_17`) | TimerC, IRQ 20 |
-| UART TX | boot string (`__vector_13`) | — | TimerC + real UART TX (`uart0.log`) |
+| UART TX | boot string and `servo_transmit` frames (`__vector_13`) | — | TimerC + real UART TX (`uart0.log`) |
 | Radio PPM input capture | `__vector_5` | — | environment → GPIO, IRQ 17 |
 | Modem clock (INT4) | — | downlink bits (`__vector_5`) | environment → GPIO, IRQ 17 |
 | GPS (UART1 RX) | — | UBX parser (`__vector_30`) | environment → real UART RX, IRQ 16 |
@@ -372,7 +389,10 @@ FBW therefore starts in MANUAL mode, driving the servos from the radio. The
 mode channel is averaged over 10 frames (upstream `AVERAGING_PERIOD`), so
 FBW switches to AUTO at the first average taken over AUTO frames only,
 about 0.75 s in; from then on it drives the servos from the Autopilot's
-commands.
+commands. The servo frames in `uart0.log` show it: the ailerons follow the
+roll stick sweep (about 1430–1680 µs) in MANUAL, then from the 16th frame
+(about 0.78 s) the motor goes to 1999 µs and the elevator to 1559 µs, as
+commanded by the Autopilot frames.
 
 **Autopilot**
 
@@ -403,13 +423,16 @@ To change the scenario:
 Known limitations
 -----------------
 
-- **`servo_transmit` is never activated.** This is an upstream defect: FBW's
-  `main()` resets `_20Hz` before `fbw_schedule()` can see it reach 3. The
-  port keeps the upstream behaviour.
 - **Fixed scenario.** The radio, GPS, ADC values and the other
   microcontroller's frames are one deterministic scenario (see section 7).
   Other flights need a new `gen_stimulus.py` table (then `make sim`) or new
   frames in the models.
+- **Some FBW task samples come out negative.** In the default run
+  `check_failsafe_task` has one sample of −1 (printed as 4294967295), which
+  also spoils its average; before the scheduling patch other FBW tasks had
+  similar samples. The harness subtracts a calibrated trap entry/exit cost
+  (`trap_overhead`) for every interrupt, and for some interrupts this seems
+  to exceed the real cost. Not investigated yet.
 - **`altitude_control_task` stays short in the default run.** The upstream
   flight plan holds the take-off block until 8 s of flight time; only then
   does it switch to altitude hold. A default run simulates 1.5 s; the long
@@ -466,7 +489,7 @@ Repository layout
 | `papabench_ibex/harness/ibex_io.h` | SoC register map and CSR helpers |
 | `papabench_ibex/link.ld` | Linker script (whole 128 KiB RAM) |
 | `papabench_ibex/harness/calib.c` | Empty instrumented function for the overhead |
-| `papabench_ibex/patches/` | Upstream bug fix applied to a build copy |
+| `papabench_ibex/patches/` | Upstream bug fixes applied to build copies |
 | `papabench_ibex/hw/` | SoC hardware patches, our FuseSoC cores, simulation environment (`rtl/`), stimulus generator (`stimulus/`), `hwtest` smoke test |
 | `bench/parallel/PapaBench/` | Upstream PapaBench (read-only) |
 | `Secure-Ibex/` | Ibex SoC submodule |

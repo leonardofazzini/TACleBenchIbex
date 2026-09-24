@@ -16,19 +16,19 @@ Code extracted from Paparazzi, a UAV autopilot that originally ran on two AVR mi
 
 ## Tasks (entry points, marked `_Pragma( "entrypoint" )` in most cases)
 
-FBW (`fbw_schedule()` in `fly_by_wire/main.c` calls them every loop iteration):
+FBW (`fbw_schedule()` in `fly_by_wire/main.c`; upstream `main()` calls it every loop iteration, our patch once per tick):
 
 | Task | Where | Activation in `fbw_schedule()` |
 |---|---|---|
-| `test_ppm_task` | `main.c` | every iteration |
-| `check_mega128_values_task` | `main.c` | every iteration |
-| `send_data_to_autopilot_task` | `main.c` | every iteration |
-| `check_failsafe_task` | `main.c` | every iteration |
-| `servo_transmit` | `servo.c` | only when `_20Hz >= 3` |
+| `test_ppm_task` | `main.c` | every iteration upstream; every tick with our patch |
+| `check_mega128_values_task` | `main.c` | every iteration upstream; every tick with our patch |
+| `send_data_to_autopilot_task` | `main.c` | every iteration upstream; every tick with our patch |
+| `check_failsafe_task` | `main.c` | every iteration upstream; every tick with our patch |
+| `servo_transmit` | `servo.c` | only when `_20Hz >= 3` (every 3rd tick with our patch) |
 
 `_1Hz`/`_20Hz` are incremented in `main()` only when `timer_periodic()` returns TRUE.
 
-**Upstream defect: `servo_transmit` is never called in the two-program build.** `main()` does `_20Hz++; if ( _20Hz >= 3 ) _20Hz = 0;` before the next `fbw_schedule()`, so the `_20Hz >= 3` test there is never true (verified in the disassembly and on Verilator: 0 activations in 61 ticks). Only `PAPABENCH_SINGLE` uses a different path.
+**Upstream defect: `servo_transmit` is never called in the two-program build.** `main()` does `_20Hz++; if ( _20Hz >= 3 ) _20Hz = 0;` before the next `fbw_schedule()`, so the `_20Hz >= 3` test there is never true (verified in the disassembly and on Verilator: 0 activations in 61 ticks). Only `PAPABENCH_SINGLE` uses a different path. Fixed by `papabench_ibex/patches/fbw_main_schedule.patch` (2026-09-24): `fbw_schedule()` does `if ( _20Hz >= 3 ) { _20Hz = 0; servo_transmit(); }` and `main()` no longer wraps `_20Hz`, so the call happens exactly once, on the first `fbw_schedule()` after every 3rd tick (a test on the tick value alone would fire on every loop iteration of that tick, ~370 times). `servo_transmit` writes 23 bytes to the UART (0, 0, 10 × big-endian width, `\n`).
 
 Autopilot (`main()` in `mainloop.c` → `periodic_task()` in `main.c` when `timer_periodic()` is TRUE):
 
@@ -46,7 +46,7 @@ Interrupt service routines are written as `SIGNAL( SIG_… )` and are **plain C 
 | FBW | `__vector_5` | Timer1 input capture (PPM, falling edge) | decodes the radio: `ICR1` widths, sync gap measured with `TCNT2` (> 7 ms); after 9 channels sets `ppm_valid` |
 | FBW | `__vector_6` | Timer1 compare A | 4017 servo driver: `OCR1A += servo_widths[ servo++ ]` (10 channels, `servo_widths` and `servo` static) |
 | FBW | `__vector_10` | SPI (slave) | one byte of the 23-byte frame with the Autopilot (`FRAME_LENGTH` = 22-byte `inter_mcu_msg` + XOR checksum); writes the next TX byte to `SPDR`, then reads the received one |
-| FBW | `__vector_13` | UART TX complete | sends the next buffered byte (only the boot string: `servo_transmit` is never called) |
+| FBW | `__vector_13` | UART TX complete | sends the next buffered byte (boot string, then the 23-byte `servo_transmit` frames) |
 | FBW | `__vector_14` | ADC | stores `ADCW` of `ADMUX & 7`, next channel, restarts (`ADSC`) |
 | Autopilot | `__vector_5` | INT4 (`CTL_BRD_V1_2_1`), modem clock | bit-bangs the downlink on PORTD.6 (start, 8 data, stop); disables INT4 when the buffer is empty |
 | Autopilot | `__vector_12` | Timer1 compare A | `link_fbw`: next SPI byte (write `SPDR`, read the received one); at the end unselects the slave, `SPI_STOP()`, sets `link_fbw_receive_complete` |
@@ -63,7 +63,7 @@ Interrupt service routines are written as `SIGNAL( SIG_… )` and are **plain C 
 - `parse_ubx()` drops a message if `gps_msg_received` is still set (`gps_nb_ovrn++`); `send_gps_pos()` clears it. During the Autopilot's 30-tick start-up wait the main loop does not consume GPS messages.
 - Flight plan (`flight_plan.h`, block 0 "init"): waits for `estimator_flight_time > 8` (seconds of flight after `send_takeOff()`), then climbs to `SECURITY_ALT`; only block 1 sets `VERTICAL_MODE_AUTO_ALT`, so `altitude_control_task` takes its long path (`altitude_pid_run()`) only after ~8 s of flight in AUTO2.
 - Radio: PPM order = channel index (`radio.h`: 0 throttle, 1 roll, 2 pitch, 3 yaw, 4 mode, 5 gain1, 6 gain2, 7 LLS, 8 calib); FBW mode = AUTO when the mode channel ≥ `MIN_PPRZ / 2`; Autopilot `PPRZ_MODE_OF_PULSE`: > 3200 AUTO2, > −4800 AUTO1, else MANUAL; takeoff needs throttle > 0.9 `MAX_PPRZ`.
-- FBW `test_ppm_task` counts `time_since_last_ppm` per main-loop iteration (~300 per tick), not per tick: without PPM the radio is "really lost" within the first tick and FBW goes AUTO.
+- Upstream FBW `fbw_schedule()` counts `time_since_last_ppm`/`time_since_last_mega128` per main-loop iteration (~370 per tick), not per tick: `radio_ok`/`mega128_ok` drop within a fraction of a tick and `check_failsafe_task` applies `failsafe` (all servos at neutral) almost always (verified 2026-09-24 on the servo frames). Fixed by `patches/fbw_main_schedule.patch` (`fbw_schedule()` only when `timer_periodic()` is TRUE, as `PAPABENCH_SINGLE`).
 
 ## Build macros
 
@@ -100,7 +100,7 @@ Interrupt service routines are written as `SIGNAL( SIG_… )` and are **plain C 
 - `autopilot/main.c:147-150`: `ModeUpdate(...)` expands to `{ ... }`, the caller adds `;`, then `else` → syntax error. Same pattern in `ad7714.c:86`.
 - `autopilot/main.c`: non-static `inline` functions (`pprz_mode_update`, `ground_calibrate`, …) have no external definition under C99 semantics → undefined references unless `-fgnu89-inline`.
 - `modem.c` and `gps_ubx.c` both define `ck_a`/`ck_b` without initializer → multiple definition under GCC ≥ 10 unless `-fcommon`.
-- `fly_by_wire/main.c`: `servo_transmit()` unreachable (see Tasks above).
+- `fly_by_wire/main.c`: `servo_transmit()` unreachable and `fbw_schedule()` called every loop iteration (see Tasks above and scenario notes) → `patches/fbw_main_schedule.patch`.
 - `sw/lib/c/math.c`: `pp_sqrt()` body is inside `#if 0` (and contains an unterminated `_Pragma` string) → returns an indeterminate value; called by `nav.c:159` (`sqrt( leg2 )`).
 - `gps_sirf.c` includes a missing `math_papabench.h`.
 

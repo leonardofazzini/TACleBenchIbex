@@ -61,6 +61,28 @@ Goal: drive PapaBench with real Ibex interrupts and peripherals instead of RAM-e
 
 ---
 
+## Task: Make FBW `servo_transmit` run — 2026-09-24
+
+Goal: patch the upstream `_20Hz` defect so that `servo_transmit` is activated once every 3 ticks (~20 Hz), as intended, with `bench/` untouched.
+
+| Date | Asked | Done | User revision |
+|---|---|---|---|
+| 2026-09-24 | Create the patch that makes the servo work | `papabench_ibex/patches/fbw_main_servo_transmit.patch`: `fbw_schedule()` resets `_20Hz` and calls `servo_transmit()` when it reaches 3; `main()` no longer wraps it. Makefile: FBW `main.c` now built from `build/fbw/patched/main.c` (same rule as the Autopilot, `MAIN_SRC`/`MAIN_PATCH`). Verilator, defaults: `servo_transmit` 20 activations (61 ticks / 3), 715 / 738 / 735 cycles; `uart_tx` ISR 523 calls; `uart0.log` 523 bytes = 63 boot + 20 × 23-byte servo frames. Autopilot ELF bit-identical. Found (pre-existing at HEAD `c09dd30`, not caused by the patch): negative task samples, see To-do | |
+
+---
+
+## Task: Run without measurements, "as on a real UAV" — 2026-09-24
+
+Decisions (user, 2026-09-24): only a build without measurements (same scenario, programs still separate, no flight-dynamics model); run length still `TICKS`.
+
+| Date | Asked | Done | User revision |
+|---|---|---|---|
+| 2026-09-24 | A version where the tasks run without analysis | Makefile `MEASURE ?= 1`; `MEASURE=0` builds in `build/<prog>-nomeasure/` with plain PapaBench objects (no `-finstrument-functions`, no exclude list), no `calib.o`, `-DPAPABENCH_MEASURE=0`; `harness.c` compiles out hooks, stats, calibrations and wrapper timing, prints only the header (`,measure=0`) and `END`. Verilator, defaults: FBW 49.97 M cycles (89 s), Autopilot 74.55 M cycles (116 s); no warnings; measured FBW results unchanged | |
+| 2026-09-24 | (same request) | Found while checking the servo frames: FBW outputs the **failsafe** widths (neutrals, all commands 0) almost all the time, in both builds. Cause (upstream PapaBench): FBW `main()` calls `fbw_schedule()` on every loop iteration (~370 per tick), and `fbw_schedule()` increments `time_since_last_ppm`/`time_since_last_mega128`, meant per 60 Hz tick (`STALLED_TIME 30 // 500ms with a 60Hz timer`), so `radio_ok`/`mega128_ok` drop within a fraction of a tick and `check_failsafe_task` calls `servo_set( failsafe )`. `PAPABENCH_SINGLE` calls `fbw_schedule()` only on a tick. Pending user decision | |
+| 2026-09-24 | Patch it, in both builds | Patch renamed `fbw_main_servo_transmit.patch` → `fbw_main_schedule.patch`, now also moves `fbw_schedule()` inside `if ( timer_periodic() )`. Verilator, defaults, both builds: servo frames follow the scenario (ailerons sweep 1430–1680 µs in MANUAL; from frame 16, ~0.78 s, AUTO: motor 1999 µs, elevator 1559 µs); the two builds differ only by a few µs of PPM jitter. Measured FBW: tasks 60 activations, `servo_transmit` 19 (669 / 727 / 700), `check_failsafe_task` has a negative sample (max 4294967295) that makes its avg meaningless; README FBW rows updated, `check_failsafe_task` marked invalid | |
+
+---
+
 ## To-do
 
 - [ ] Decide with the user: libgcc is rv32imc-only (compressed instructions inside soft-float helpers, executed by both FBW and Autopilot) — accept, or build an rv32im libgcc.
@@ -68,13 +90,15 @@ Goal: drive PapaBench with real Ibex interrupts and peripherals instead of RAM-e
 - [x] Confirm the scenario with the user: radio sticks, GPS circle, ADC values, virtual-MCU frames (mode MANUAL→AUTO1→AUTO2, full throttle) are my choices (`gen_stimulus.py`, `*_periph.c`). → accepted, described in README section 7 "The simulated scenario" (user, 2026-09-23).
 - [x] `altitude_control_task` long path needs > 8 s of flight after take-off (flight plan block 0): decide whether to report a long run (TICKS ≈ 600) in the README. → yes, full results of the TICKS=600 run in the README (user, 2026-09-23).
 - [x] Trap entry/exit cost of every interrupt is inside task samples (only handler bodies are subtracted); the ADC fires every 5200 cycles. Decide: subtract a calibrated per-interrupt constant, make the ADC optional, or keep raw. → keep raw, explained in the README Known limitations (user, 2026-09-23).
-- [ ] Decide with the user about FBW `servo_transmit`: never activated by the upstream two-program scheduler (`_20Hz` reset before `fbw_schedule()` tests `>= 3`). Leave faithful, or patch the condition.
+- [x] Decide with the user about FBW `servo_transmit`: never activated by the upstream two-program scheduler (`_20Hz` reset before `fbw_schedule()` tests `>= 3`). Leave faithful, or patch the condition. → patched (user, 2026-09-24), now in `patches/fbw_main_schedule.patch`.
 - [x] Wire PapaBench to the real peripherals (next steps of the real-interrupts task): TimerA as AVR Timer1 (FBW servo `__vector_6`, Autopilot `link_fbw` `__vector_12`), servos on PWM channels 0–9, TimerB/TimerC as SPI and ADC event sources, UART TX for downlink, generic ISR cycle accounting + per-ISR stats. → done 2026-09-23 (downlink is the modem, not the UART: UART TX serves FBW's boot string).
 - [x] Own simulation top with a deterministic stimulus generator (UBX stream on `uart_rx`, PPM / modem clock on `gp_i[0]` with an edge latch acknowledged through a `gp_o` bit), replacing the `uartdpi` RX input. → patch 0003 + `hw/rtl/papabench_env.sv`, 2026-09-23.
 - [x] Other AVR timer registers stay frozen in RAM (e.g. `TCNT1`, read by `link_fbw.c` `OCR1A = TCNT1 + 200`); decide whether they should follow `mtime`. → `TCNT1`/`TCNT2`/`ICR1` refreshed from TimerA before each upstream ISR (only ISRs read them), 2026-09-23.
 - [x] Autopilot image has ~2.6 KB left in the 56 KiB `ram` region of the stock `link.ld`: a harness linker script may be needed for `-O2` or more harness code. → `papabench_ibex/link.ld` (128 KiB), 2026-09-23.
 - [x] Decide with the user whether the ISRs (`__vector_5/6/10` FBW, `__vector_5/12/17/30` Autopilot) are measured too. → measured since they run from real interrupts (`isr,` lines, plus ADC and UART TX handlers), 2026-09-23.
 - [ ] Upstream `pp_sqrt()` (`sw/lib/c/math.c`) has its body under `#if 0` and returns garbage; used by `nav.c:159`. Decide whether to leave it (faithful to TACLeBench) or provide a working one via a patch.
+- [x] FBW failsafe almost always active (see task "Run without measurements"): decide whether to patch FBW `main()` so `fbw_schedule()` runs once per tick (as in `PAPABENCH_SINGLE`), in both builds or only with `MEASURE=0`. → both builds (user, 2026-09-24), `patches/fbw_main_schedule.patch`.
+- [ ] FBW task samples can go negative (seen at HEAD `c09dd30`, with and without the servo patch, default run): `send_data_to_autopilot_task` max 4294967294 (= −2), `test_ppm_task` 4294967290 (= −6) without the patch; the `trap_overhead` (102) added per interrupt seems to exceed the real trap cost for some interrupts. The README results table predates the `trap_overhead` subtraction (min values differ). Investigate, then refresh the README table. After the once-per-tick patch: `check_failsafe_task` max 4294967295 (= −1), README row marked invalid.
 - [ ] Verify the Ibex bus behaviour on an access to an unmapped low address (0x20–0xFF) — no longer blocking, since no SFR access reaches low memory.
 
 ---
