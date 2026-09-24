@@ -1,0 +1,30 @@
+--- a/main.c
++++ b/main.c
+@@ -148,8 +148,10 @@
+   check_mega128_values_task();
+   send_data_to_autopilot_task();
+   check_failsafe_task();
+-  if ( _20Hz >= 3 )
++  if ( _20Hz >= 3 ) {
++    _20Hz = 0;
+     servo_transmit();
++  }
+ }
+ 
+ #ifndef PAPABENCH_SINGLE
+@@ -159,14 +161,12 @@
+   #ifndef NO_MAINLOOP
+   while ( 1 ) {
+   #endif
+-    fbw_schedule();
+     if ( timer_periodic() ) {
++      fbw_schedule();
+       _1Hz++;
+       _20Hz++;
+       if ( _1Hz >= 60 )
+         _1Hz = 0;
+-      if ( _20Hz >= 3 )
+-        _20Hz = 0;
+     }
+     #ifndef NO_MAINLOOP
+   }

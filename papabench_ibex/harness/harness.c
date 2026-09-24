@@ -36,6 +36,11 @@
     isr_overhead,<cycles>
     isr,<name>,<count>,<min>,<max>,<avg>
     END
+
+  With PAPABENCH_MEASURE=0 (make MEASURE=0) nothing is timed: no hooks (the
+  PapaBench objects are not instrumented), no calibration, the wrappers only
+  dispatch and synchronise the models. Same scenario, same stop after the
+  ticks; the output is the header line (with ",measure=0") and END.
 */
 
 #include "reference_system_common.h"
@@ -51,6 +56,10 @@
 #define PAPABENCH_TICKS 61
 #endif
 
+#ifndef PAPABENCH_MEASURE
+#define PAPABENCH_MEASURE 1
+#endif
+
 #define PAPABENCH_MAX_TASKS 16
 #define HARNESS_CALIB PAPABENCH_MAX_TASKS
 #define PAPABENCH_MAX_ISRS 8
@@ -61,6 +70,11 @@ const unsigned int papabench_tick_cycles = PAPABENCH_TICK_CYCLES;
 #define TIMER_IRQ_NUM 7
 
 
+static volatile uint32_t harness_ticks;
+static uint64_t harness_timecmp;
+
+
+#if PAPABENCH_MEASURE
 struct harness_stat {
   papabench_fn_t first;
   papabench_fn_t last;
@@ -89,8 +103,7 @@ static struct harness_stat *harness_open;
 static volatile uint32_t harness_isr_cycles;
 /* Trap entry/exit cycles of one interrupt, outside the wrapper's reads */
 static uint32_t harness_trap_cycles;
-static volatile uint32_t harness_ticks;
-static uint64_t harness_timecmp;
+#endif
 
 
 static inline uint32_t harness_mcycle( void )
@@ -102,6 +115,7 @@ static inline uint32_t harness_mcycle( void )
 }
 
 
+#if PAPABENCH_MEASURE
 /* ------------------------------------------------ instrumentation hooks --- */
 
 /*
@@ -159,6 +173,9 @@ void __cyg_profile_func_exit( void *fn, void *site )
 }
 
 
+#endif /* PAPABENCH_MEASURE */
+
+
 /* --------------------------------------------------------------- output --- */
 
 static void harness_putdec( uint32_t v )
@@ -175,6 +192,7 @@ static void harness_putdec( uint32_t v )
 }
 
 
+#if PAPABENCH_MEASURE
 static void harness_field( uint32_t v )
 {
   putchar( ',' );
@@ -218,6 +236,12 @@ static void harness_report( void )
     harness_stat_line( "isr,", papabench_isrs[ t ].name, &harness_isr_stat[ t ] );
   puts( "END\n" );
 }
+#else
+static void harness_report( void )
+{
+  puts( "END\n" );
+}
+#endif
 
 
 /* ---------------------------------------------------------------- timer --- */
@@ -241,6 +265,7 @@ static void __attribute__( ( noinline ) ) harness_tick( void )
 
 /* ------------------------------------------------- peripheral interrupts --- */
 
+#if PAPABENCH_MEASURE
 static void harness_stat_add( struct harness_stat *s, uint32_t c )
 {
   if ( c < s->min )
@@ -250,8 +275,10 @@ static void harness_stat_add( struct harness_stat *s, uint32_t c )
   s->sum += c;
   s->count++;
 }
+#endif
 
 
+#if PAPABENCH_MEASURE
 /* Upstream ISRs are never nested (Ibex clears mstatus.MIE on trap entry) */
 void papabench_isr_run( unsigned int id, papabench_fn_t fn )
 {
@@ -260,11 +287,20 @@ void papabench_isr_run( unsigned int id, papabench_fn_t fn )
   fn();
   harness_stat_add( &harness_isr_stat[ id ], harness_mcycle() - t0 );
 }
+#else
+void papabench_isr_run( unsigned int id, papabench_fn_t fn )
+{
+  ( void ) id;
+  fn();
+}
+#endif
 
 
+#if PAPABENCH_MEASURE
 static void harness_isr_calib_fn( void )
 {
 }
+#endif
 
 
 /*
@@ -277,6 +313,7 @@ static void harness_isr_calib_fn( void )
   the whole interrupt. Dispatchers must not be inlined (noinline or another
   translation unit), or the wrappers would differ.
 */
+#if PAPABENCH_MEASURE
 #define HARNESS_IRQ_WRAPPER( name, dispatch )                            \
   static void __attribute__( ( interrupt ) ) name( void )                \
   {                                                                     \
@@ -285,6 +322,14 @@ static void harness_isr_calib_fn( void )
     papabench_periph_poll();                                            \
     harness_isr_cycles += harness_mcycle() - t0 + harness_trap_cycles;  \
   }
+#else
+#define HARNESS_IRQ_WRAPPER( name, dispatch )                            \
+  static void __attribute__( ( interrupt ) ) name( void )                \
+  {                                                                     \
+    dispatch();                                                         \
+    papabench_periph_poll();                                            \
+  }
+#endif
 
 HARNESS_IRQ_WRAPPER( harness_timer_isr, harness_tick )
 HARNESS_IRQ_WRAPPER( harness_irq_timer_a, papabench_irq_timer_a )
@@ -294,6 +339,7 @@ HARNESS_IRQ_WRAPPER( harness_irq_uart, papabench_irq_uart )
 HARNESS_IRQ_WRAPPER( harness_irq_gpio, papabench_irq_gpio )
 
 
+#if PAPABENCH_MEASURE
 /* Start-up measurement of harness_trap_cycles: a TimerC interrupt hits a
    loop that reads mcycle back to back. The iteration it lands in takes the
    loop's normal time + trap + wrapper body; the body is known
@@ -349,13 +395,16 @@ static void harness_trap_calib( void )
   harness_isr_cycles = 0;
   harness_trap_cycles = best;
 }
+#endif
 
 
 /* ----------------------------------------------------------------- main --- */
 
 int main( void )
 {
+#if PAPABENCH_MEASURE
   unsigned int t;
+#endif
 
   pcount_enable( 0 );
   pcount_reset();
@@ -369,6 +418,9 @@ int main( void )
   harness_putdec( papabench_startup_ticks );
   puts( ",tick_cycles=" );
   harness_putdec( PAPABENCH_TICK_CYCLES );
+#if !PAPABENCH_MEASURE
+  puts( ",measure=0" );
+#endif
   putchar( '\n' );
 
   if ( papabench_ntasks > PAPABENCH_MAX_TASKS ||
@@ -381,6 +433,7 @@ int main( void )
     return 1;
   }
 
+#if PAPABENCH_MEASURE
   harness_ntasks = papabench_ntasks;
   for ( t = 0; t <= PAPABENCH_MAX_TASKS; t++ )
     harness_stat[ t ].min = 0xFFFFFFFF;
@@ -403,6 +456,7 @@ int main( void )
 
   /* Trap entry/exit cost of the interrupt wrappers */
   harness_trap_calib();
+#endif
 
   /* Peripheral models: real peripherals set up, model interrupts installed.
      TimerA/B/C and the UART only interrupt once a model arms them; the GPIO

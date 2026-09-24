@@ -4,6 +4,9 @@
 #   make PROG=autopilot      build build/autopilot/autopilot.elf
 #   make PROG=fbw run        build and run on Verilator (results printed from
 #                            build/fbw/reference_system.log)
+#   make PROG=fbw MEASURE=0 run
+#                            same scenario, no measurement: no hooks, no
+#                            calibration, no results (build/fbw-nomeasure/)
 #   make all-progs           build both
 #   make sim                 build the Verilator simulator into build/sim/ from
 #                            the Secure-Ibex sources + hw/patches (done by 'run'
@@ -25,6 +28,9 @@
 #   FUSESOC      FuseSoC executable (default 'fusesoc'; its venv must be active,
 #                the Secure-Ibex tool check runs 'pip3 show edalize')
 #   OPT          optimisation level (default -Os)
+#   MEASURE      1 (default): per-task and per-ISR mcycle measurement;
+#                0: the program just runs (plain objects, harness without
+#                timing), still stopped after TICKS ticks
 #
 # Nothing is written under bench/ or Secure-Ibex/: sources are read from
 # there, objects go to build/<prog>/, the simulator to build/sim/. SoC hardware
@@ -36,6 +42,7 @@ PROG        ?= fbw
 TICKS       ?= 61
 TICK_CYCLES ?= 819200
 OPT         ?= -Os
+MEASURE     ?= 1
 
 HERE        := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ROOT        := $(abspath $(HERE)/..)
@@ -50,7 +57,11 @@ SIM_DEFAULT := $(HERE)/build/sim/sim_ibex-verilator/Vreference_system
 SIM ?= $(SIM_DEFAULT)
 FUSESOC ?= fusesoc
 
+ifeq ($(MEASURE),0)
+BUILD := $(HERE)/build/$(PROG)-nomeasure
+else
 BUILD := $(HERE)/build/$(PROG)
+endif
 ELF   := $(BUILD)/$(PROG).elf
 
 CC      := riscv32-unknown-elf-gcc
@@ -76,7 +87,8 @@ PB_CFLAGS := $(BASE_CFLAGS) -fcommon -fgnu89-inline -Wno-unknown-pragmas \
 
 # Ibex side: Secure-Ibex common library + harness
 IBEX_CFLAGS := $(BASE_CFLAGS) -I$(IBEX_COMMON) -I$(HERE)/harness \
-  -DPAPABENCH_TICKS=$(TICKS) -DPAPABENCH_TICK_CYCLES=$(TICK_CYCLES)
+  -DPAPABENCH_TICKS=$(TICKS) -DPAPABENCH_TICK_CYCLES=$(TICK_CYCLES) \
+  -DPAPABENCH_MEASURE=$(MEASURE)
 
 LDFLAGS := $(ARCH_FLAGS) -static -nostdlib -nostartfiles -Wl,--gc-sections \
   -T $(LINKER_SCRIPT) -Wl,-Map=$(BUILD)/$(PROG).map
@@ -89,11 +101,16 @@ ifeq ($(PROG),fbw)
 PB_CFLAGS += -D__AVR_ATmega8__ -DPAPABENCH_TIFR_ADDR=0x58 \
   -I$(PB_AIR)/fly_by_wire
 PB_CFLAGS += -I$(PB)/arch/include/avr -I$(PB)/arch/include/avr/arch
+# main.c is built from a patched copy: fbw_schedule() once per tick (its
+# timeouts count ticks) and servo_transmit reachable (main() wrapped _20Hz
+# before fbw_schedule() could see 3)
 PB_SRCS := $(addprefix $(PB_AIR)/fly_by_wire/, \
-  adc_fbw.c main.c ppm.c servo.c spi.c uart.c)
-PATCHED :=
+  adc_fbw.c ppm.c servo.c spi.c uart.c)
+PATCHED := $(BUILD)/patched/main.c
 MAIN_OBJ := main.o
 GLUE := $(HERE)/harness/fbw_glue.c
+MAIN_SRC := $(PB_AIR)/fly_by_wire/main.c
+MAIN_PATCH := $(HERE)/patches/fbw_main_schedule.patch
 else ifeq ($(PROG),autopilot)
 # TIFR = _SFR_IO8(0x36) on ATmega128.
 # autopilot headers first: fly_by_wire has spi.h/uart.h/timer.h with the same
@@ -109,16 +126,17 @@ PB_SRCS := $(addprefix $(PB_AIR)/autopilot/, \
 PATCHED := $(BUILD)/patched/main.c
 MAIN_OBJ := mainloop.o
 GLUE := $(HERE)/harness/autopilot_glue.c
-
-# Upstream bug fix applied to a copy; bench/ is never modified
-$(BUILD)/patched/main.c: $(PB_AIR)/autopilot/main.c \
-  $(HERE)/patches/autopilot_main_modeupdate.patch
-	@mkdir -p $(dir $@)
-	cp $< $@
-	patch -s $@ < $(word 2,$^)
+MAIN_SRC := $(PB_AIR)/autopilot/main.c
+MAIN_PATCH := $(HERE)/patches/autopilot_main_modeupdate.patch
 else
 $(error PROG must be fbw or autopilot)
 endif
+
+# Upstream bug fix applied to a copy; bench/ is never modified
+$(BUILD)/patched/main.c: $(MAIN_SRC) $(MAIN_PATCH)
+	@mkdir -p $(dir $@)
+	cp $< $@
+	patch -s $@ < $(word 2,$^)
 
 IBEX_SRCS := $(IBEX_COMMON)/reference_system_common.c \
   $(IBEX_COMMON)/timer.c $(IBEX_COMMON)/uart.c
@@ -131,7 +149,10 @@ GLUE_OBJ     := $(BUILD)/glue/$(notdir $(GLUE:.c=.o))
 PERIPH_SRCS  := $(HERE)/harness/periph.c $(HERE)/harness/$(PROG)_periph.c
 PERIPH_OBJS  := $(patsubst %.c,$(BUILD)/glue/%.o,$(notdir $(PERIPH_SRCS)))
 IBEX_OBJS    := $(patsubst %.c,$(BUILD)/ibex/%.o,$(notdir $(IBEX_SRCS)))
-HARNESS_OBJS := $(addprefix $(BUILD)/harness/,harness.o runtime.o calib.o)
+HARNESS_OBJS := $(addprefix $(BUILD)/harness/,harness.o runtime.o)
+ifneq ($(MEASURE),0)
+HARNESS_OBJS += $(BUILD)/harness/calib.o
+endif
 CRT_OBJ      := $(BUILD)/ibex/crt0.o
 OBJS := $(PB_OBJS) $(GLUE_OBJ) $(PERIPH_OBJS) $(IBEX_OBJS) $(HARNESS_OBJS) \
   $(CRT_OBJ)
@@ -174,8 +195,14 @@ $(EXCLUDE_TXT): $(PLAIN_OBJS) $(TASKS_TXT)
 	    echo "ERROR: exclude entries are substrings of task names:" $$bad; \
 	    exit 1; fi
 
+ifeq ($(MEASURE),0)
+INSTR_FLAGS :=
+INSTR_DEPS  :=
+else
 INSTR_FLAGS = -finstrument-functions \
   -finstrument-functions-exclude-function-list=$$(paste -sd, $(EXCLUDE_TXT))
+INSTR_DEPS  := $(EXCLUDE_TXT)
+endif
 
 vpath %.c $(sort $(dir $(PB_SRCS)))
 
@@ -213,21 +240,19 @@ $(BUILD)/plain/%.o: %.c
 	$(CC) $(PB_CFLAGS) -fkeep-inline-functions -fkeep-static-functions \
 	  -w -c $< -o $@
 
-# PapaBench, instrumented (linked)
-$(BUILD)/pb/%.o: %.c $(EXCLUDE_TXT)
+# PapaBench, instrumented (linked; plain with MEASURE=0)
+$(BUILD)/pb/%.o: %.c $(INSTR_DEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(PB_CFLAGS) $(INSTR_FLAGS) -MMD -c $< -o $@
 
-ifeq ($(PROG),autopilot)
 $(BUILD)/plain/main.o: $(PATCHED)
 	@mkdir -p $(dir $@)
 	$(CC) $(PB_CFLAGS) -fkeep-inline-functions -fkeep-static-functions \
 	  -w -c $< -o $@
 
-$(BUILD)/pb/main.o: $(PATCHED) $(EXCLUDE_TXT)
+$(BUILD)/pb/main.o: $(PATCHED) $(INSTR_DEPS)
 	@mkdir -p $(dir $@)
 	$(CC) $(PB_CFLAGS) $(INSTR_FLAGS) -MMD -c $< -o $@
-endif
 
 $(GLUE_OBJ): $(GLUE)
 	@mkdir -p $(dir $@)
