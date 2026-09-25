@@ -3,23 +3,32 @@
 
   AVR source              Ibex resource               upstream ISR
   Timer1 compare A        TimerD channel 0            __vector_12 link_fbw
-  SPI master              TimerC channel 0            __vector_17 SPI
+  SPI master              SPI master, IRQ 20          __vector_17 SPI
   ADC conversion          TimerB channel 0            __vector_21
   UART1 receive (GPS)     UART RX, IRQ 16             __vector_30 GPS
-  INT4 (modem clock)      GPIO gp_i[1], IRQ 21        __vector_5  modem
+  INT4 (modem clock)      GPIO bank 1 gp_i[0], IRQ 24 __vector_5  modem
 
-  SPI master: link_fbw_send() and the OCR1A ISR write SPDR to send a byte;
-  the transfer (8 bits at the SPCR clock rate) starts at the first
-  synchronisation point after the software touched SPDR while the SPI is
-  enabled as master (papabench_spdr_accesses). The FBW MCU does not exist
-  in this build: a virtual slave answers each frame with the bytes of
-  ap_spi_frame() (deterministic scenario: radio OK, mode switch
-  MANUAL -> AUTO1 -> AUTO2 within the first 4 frames, full throttle), which
-  is what radio_control_task receives.
+  SPI: the Autopilot is the master of the inter-MCU link, on the real SPI
+  master. The model follows SPCR (SPE + MSTR = enabled, SPR1:0 = clock:
+  fck/16 is 1 MHz, DIV = 24) and PORTB.0 (slave 0 select = CS). The bytes
+  link_fbw_send() and the OCR1A ISR write to SPDR are pushed into TXDATA
+  (pb_spdr_flush()), which starts the transfer; the byte received raises
+  IRQ 20, the model pops it from RXDATA (what the OCR1A ISR later reads
+  from SPDR) and runs the SPI ISR with SPIF set.
+
+  Who is the slave depends on the build. Joint run (PAPABENCH_JOINT=1): the
+  real FBW on the other MCU (hw/rtl/papabench_dual.sv). Single run: a
+  virtual FBW, played by this model on the SoC's SPI slave (looped back
+  from the master on chip, IRQ 21), which answers each frame with the bytes
+  of ap_spi_frame() (deterministic scenario: radio OK, mode switch
+  MANUAL -> AUTO1 -> AUTO2 within the first 4 frames, full throttle), what
+  radio_control_task receives, and checks the checksum of the Autopilot's
+  frames.
 
   GPS UBX bytes and the modem clock come from the simulation environment
-  (hw/rtl/papabench_env.sv) through the UART and gp_i[1]; the modem data bit
-  (PORTD.6) goes out on gp_o.
+  (hw/rtl/papabench_env.sv) through the UART and gp_i[0] of GPIO bank 1
+  (falling edges raise IRQ 24); the modem data bit (PORTD.6) goes out on
+  gp_o[1] of the same bank.
 */
 
 #include <arch/io.h>
@@ -71,19 +80,102 @@ static void ap_counters( void )
 
 static struct pb_oc ap_oc = { &pb_timer_d, 0 };
 
+static void ap_spi_flush( int last_is_read );
 
+
+/* The ISR sends the next byte (SPDR write, then read of the byte
+   received) or, after the last one, reads it and stops the SPI */
 static void ap_oc1a_event( void )
 {
   ap_counters();
+  ap_spi_flush( 0 );
   papabench_isr_run( AP_ISR_OC1A, __vector_12 );
+  ap_spi_flush( 1 );
 }
 
 
 /* ---------------------------------------------------------------- SPI --- */
 
+/* autopilot/spi.h: slave 0 (the FBW) selected by PORTB.0 low */
+#define AP_SPI_SS0_PIN 0
+
+/* autopilot/link_fbw.h */
+extern volatile uint8_t link_fbw_nb_err;
+
+static unsigned int ap_spdr_seen;
+static unsigned int ap_spi_ctrl = ~0u, ap_spi_div = ~0u, ap_spi_cs;
+static unsigned int ap_spi_frames;
+
+
+static void ap_spi_irq( void )
+{
+  while ( !( IBEX_REG( IBEX_SPI_MASTER + IBEX_SPI_STATUS ) &
+             IBEX_SPI_RX_EMPTY ) ) {
+    papabench_spdr_rx =
+      ( unsigned char ) IBEX_REG( IBEX_SPI_MASTER + IBEX_SPI_RXDATA );
+    ap_counters();
+    SPSR |= _BV( SPIF );
+    if ( SPCR & _BV( SPIE ) ) {
+      papabench_isr_run( AP_ISR_SPI, __vector_17 );
+      /* SPIF is cleared by hardware when the vector executes */
+      SPSR &= ~_BV( SPIF );
+    }
+  }
+}
+
+
+/* Push what the software wrote to SPDR into the master's TX FIFO, which
+   starts the transfer; an access made with the SPI off starts nothing */
+static void ap_spi_flush( int last_is_read )
+{
+  unsigned int on = ( SPCR & _BV( SPE ) ) && ( SPCR & _BV( MSTR ) );
+
+  pb_spdr_flush( &ap_spdr_seen, last_is_read, on ? IBEX_SPI_MASTER : 0 );
+}
+
+
+static void ap_spi_sync( void )
+{
+  static const unsigned int div[ 4 ] = { 4, 16, 64, 128 };
+  unsigned int on = ( SPCR & _BV( SPE ) ) && ( SPCR & _BV( MSTR ) );
+  /* The select pin drives the slave only once it is an output (DDRB):
+     PORTB.0 is 0 from reset until spi_init() */
+  unsigned int cs = ( DDRB & _BV( AP_SPI_SS0_PIN ) ) &&
+                    !( PORTB & _BV( AP_SPI_SS0_PIN ) );
+  unsigned int ctrl = on ?
+    IBEX_SPI_EN | ( ( SPCR & _BV( CPOL ) ) ? IBEX_SPI_CPOL : 0 ) |
+    ( ( SPCR & _BV( CPHA ) ) ? IBEX_SPI_CPHA : 0 ) : 0;
+  /* SCK = 16 MHz / div (AVR) = 50 MHz / ( 2 * ( DIV + 1 ) ), rounded down */
+  unsigned int d = ( div[ SPCR & 0x3 ] * 25 + 15 ) / 16 - 1;
+
+  /* Chip select first, then enable and clock, then the bytes */
+  if ( cs != ap_spi_cs ) {
+    ap_spi_cs = cs;
+    IBEX_REG( IBEX_SPI_MASTER + IBEX_SPI_CS ) = cs;
+    if ( !cs )
+      ap_spi_frames++;
+  }
+  if ( d != ap_spi_div ) {
+    ap_spi_div = d;
+    IBEX_REG( IBEX_SPI_MASTER + IBEX_SPI_DIV ) = d;
+  }
+  if ( ctrl != ap_spi_ctrl ) {
+    ap_spi_ctrl = ctrl;
+    IBEX_REG( IBEX_SPI_MASTER + IBEX_SPI_CTRL ) = ctrl;
+    IBEX_REG( IBEX_SPI_MASTER + IBEX_SPI_IE ) = ctrl ? IBEX_SPI_IE_RX : 0;
+  }
+  ap_spi_flush( 0 );
+}
+
+
+#if !PAPABENCH_JOINT
+/* ------------------------------------------------------ virtual FBW --- */
+
 static unsigned char ap_frame[ FRAME_LENGTH ];
-static unsigned char ap_spi_busy, ap_spi_in_frame;
-static unsigned int ap_spi_seen, ap_spi_idx, ap_spi_nframe;
+/* Next byte of ap_frame to queue, bytes received in this frame */
+static unsigned int ap_vfbw_tx, ap_vfbw_rx;
+static unsigned int ap_vfbw_nframe, ap_vfbw_errors;
+static unsigned char ap_vfbw_xor;
 
 
 /* FBW status, frame n: radio OK with averaged channels; mode stick
@@ -110,46 +202,63 @@ static void ap_spi_frame( unsigned int n )
 }
 
 
-static void ap_spi_event( void )
+/* Keep the slave's TX FIFO ahead of the master (with CPHA = 0 a byte must
+   be queued before the master starts it) */
+static void ap_vfbw_fill( void )
 {
-  ap_spi_busy = 0;
-  papabench_spdr_rx = ap_frame[ ap_spi_idx < FRAME_LENGTH ? ap_spi_idx : 0 ];
-  ap_spi_idx++;
-  ap_counters();
-  SPSR |= _BV( SPIF );
-  if ( SPCR & _BV( SPIE ) ) {
-    papabench_isr_run( AP_ISR_SPI, __vector_17 );
-    /* SPIF is cleared by hardware when the vector executes */
-    SPSR &= ~_BV( SPIF );
+  while ( ap_vfbw_tx < FRAME_LENGTH &&
+          !( IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_STATUS ) & IBEX_SPI_TX_FULL ) )
+    IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_TXDATA ) = ap_frame[ ap_vfbw_tx++ ];
+}
+
+
+static void ap_vfbw_start( void )
+{
+  ap_spi_frame( ap_vfbw_nframe );
+  ap_vfbw_tx = 0;
+  ap_vfbw_rx = 0;
+  ap_vfbw_xor = 0;
+  ap_vfbw_fill();
+}
+
+
+/* IRQ 21: a byte from the Autopilot, or the end of its frame (chip select
+   released): check it, queue the next frame */
+static void ap_vfbw_irq( void )
+{
+  while ( !( IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_STATUS ) &
+             IBEX_SPI_RX_EMPTY ) ) {
+    unsigned char b =
+      ( unsigned char ) IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_RXDATA );
+
+    if ( ++ap_vfbw_rx < FRAME_LENGTH )
+      ap_vfbw_xor ^= b;
+    else if ( ap_vfbw_rx == FRAME_LENGTH && b != ap_vfbw_xor )
+      ap_vfbw_errors++;
+    ap_vfbw_fill();
+  }
+  /* A select without transfers (pin glitch) leaves the frame queued: the
+     TX FIFO cannot be flushed, a restart would shift every later frame */
+  if ( IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_STATUS ) & IBEX_SPI_FRAME_DONE ) {
+    IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_STATUS ) = IBEX_SPI_FRAME_DONE;
+    if ( ap_vfbw_rx ) {
+      if ( ap_vfbw_rx != FRAME_LENGTH )
+        ap_vfbw_errors++;
+      ap_vfbw_nframe++;
+      ap_vfbw_start();
+    }
   }
 }
 
 
-static void ap_spi_sync( void )
+static void ap_vfbw_init( void )
 {
-  static const unsigned int div[ 4 ] = { 4, 16, 64, 128 };
-
-  /* An SPDR access with the SPI off starts nothing (the frame's last byte
-     is read right before SPI_STOP()): consume it, or a sync point between
-     the next SPI_START() and its SPDR write would start a spurious
-     transfer and shift the frame by one byte */
-  if ( !( SPCR & _BV( SPE ) ) || !( SPCR & _BV( MSTR ) ) ) {
-    ap_spi_in_frame = 0;
-    ap_spi_seen = papabench_spdr_accesses;
-    return;
-  }
-  if ( ap_spi_busy || papabench_spdr_accesses == ap_spi_seen )
-    return;
-  ap_spi_seen = papabench_spdr_accesses;
-  if ( !ap_spi_in_frame ) {
-    ap_spi_in_frame = 1;
-    ap_spi_idx = 0;
-    ap_spi_frame( ap_spi_nframe++ );
-  }
-  ap_spi_busy = 1;
-  pb_arm( &pb_timer_c, 0,
-          pb_now() + PB_IBEX_OF_AVR( 8 * div[ SPCR & 0x3 ] ) );
+  IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_CTRL ) = IBEX_SPI_EN;
+  IBEX_REG( IBEX_SPI_SLAVE + IBEX_SPI_IE ) =
+    IBEX_SPI_IE_RX | IBEX_SPI_IE_DONE;
+  ap_vfbw_start();
 }
+#endif
 
 
 /* ---------------------------------------------------------------- ADC --- */
@@ -207,7 +316,7 @@ static unsigned char ap_modem_on;
 
 static void ap_modem_irq( void )
 {
-  pb_gpo_toggle( PB_GPO_MODEM_ACK );
+  pb_gpi_ack();
   if ( EIMSK & _BV( INT4 ) ) {
     papabench_isr_run( AP_ISR_MODEM, __vector_5 );
     pb_gpo_write( PB_GPO_MODEM_TX,
@@ -234,12 +343,18 @@ static void ap_modem_sync( void )
 
 /* --------------------------------------------------------------- init --- */
 
+const unsigned int papabench_gpio = IBEX_GPIO1;
+
 const struct papabench_irq papabench_irqs[] = {
   { IBEX_IRQ_TIMER_B, papabench_irq_timer_b, 1 },
-  { IBEX_IRQ_TIMER_C, papabench_irq_timer_c, 1 },
   { IBEX_IRQ_TIMER_D, papabench_irq_timer_d, 1 },
+  { IBEX_IRQ_SPI_M, ap_spi_irq, 1 },
   { IBEX_IRQ_UART, ap_gps_irq, 1 },
   { IBEX_IRQ_GPIO1, ap_modem_irq, 0 },
+#if !PAPABENCH_JOINT
+  /* virtual FBW */
+  { IBEX_IRQ_SPI_S, ap_vfbw_irq, 1 },
+#endif
 };
 
 const unsigned int papabench_nirqs =
@@ -250,11 +365,13 @@ void papabench_periph_init( void )
 {
   pb_timer_d.fn[ 0 ] = ap_oc1a_event;
   pb_timer_b.fn[ 0 ] = ap_adc_event;
-  pb_timer_c.fn[ 0 ] = ap_spi_event;
-  ap_spi_seen = papabench_spdr_accesses;
+  ap_spdr_seen = papabench_spdr_accesses;
+#if !PAPABENCH_JOINT
+  ap_vfbw_init();
+#endif
 
-  pb_gpo_write( PB_GPO_ENV_AUTOPILOT | PB_GPO_MODEM_TX,
-                PB_GPO_ENV_AUTOPILOT | PB_GPO_MODEM_TX );
+  pb_gpio_init();
+  pb_gpo_write( PB_GPO_ENV | PB_GPO_MODEM_TX, PB_GPO_ENV | PB_GPO_MODEM_TX );
 }
 
 
@@ -265,4 +382,20 @@ void papabench_periph_poll( void )
   ap_adc_sync();
   ap_modem_sync();
   pb_avr_snapshot_done();
+}
+
+
+/* frames: frames selected by the master (chip-select releases); frames_err:
+   upstream count of FBW frames with a bad checksum (link_fbw_nb_err);
+   spdr_dropped: SPDR writes dropped, previous byte still queued (periph.h);
+   virtual_*: Autopilot frames checked by the virtual FBW (single run) */
+void papabench_periph_report( void )
+{
+  papabench_report_value( "frames", ap_spi_frames );
+  papabench_report_value( "frames_err", link_fbw_nb_err );
+  papabench_report_value( "spdr_dropped", pb_spdr_dropped );
+#if !PAPABENCH_JOINT
+  papabench_report_value( "virtual_frames", ap_vfbw_nframe );
+  papabench_report_value( "virtual_err", ap_vfbw_errors );
+#endif
 }

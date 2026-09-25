@@ -1,11 +1,11 @@
 Secure-Ibex SoC patch (PapaBench on Ibex): the Verilator top instantiates
 papabench_pwm_monitor (hw/rtl/papabench_pwm_monitor.sv), which logs every
 PWM pulse (rising-edge cycle, channel, width) to pwm.log.
-Applied by 'make sim' after 0003, to a copy under build/sim/hw/ (patch -p1).
+Applied by 'make sim' after 0005, to a copy under build/sim/hw/ (patch -p1).
 
 --- a/rtl/top_simulation/reference_system.sv
 +++ b/rtl/top_simulation/reference_system.sv
-@@ -91,6 +91,16 @@
+@@ -114,6 +114,16 @@
      .uart_rx_o (uart_rx)
    );
  

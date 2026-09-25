@@ -1,0 +1,70 @@
+CAPI=2:
+# Joint PapaBench simulation: two patched Secure-Ibex SoCs (FBW and
+# Autopilot MCUs) linked by SPI, in one Verilator model
+# (hw/rtl/papabench_dual.sv, testbench hw/dv/papabench_dual.cc).
+#
+# Copied by 'make sim-dual' into build/sim/hw/ next to the staged, patched RTL
+# (same staging as papabench:soc:reference_system); paths are relative to
+# that directory. Same Verilator options as the sim_ibex target, without the
+# UART/debugger DPI and the performance-counter dump.
+name: "papabench:soc:dual"
+description: "Two standard-Ibex reference systems (PapaBench FBW + Autopilot) linked by SPI (Verilator)"
+
+filesets:
+  files_rtl:
+    depend:
+      - papabench:soc:reference_system_core
+      - lowrisc:ibex:ibex_top
+
+  files_verilator:
+    depend:
+      - lowrisc:ibex:sim_shared
+      - lowrisc:dv_verilator:memutil_verilator
+      - lowrisc:dv_verilator:simutil_verilator
+    files:
+      - dv/papabench_dual.cc: { file_type: cppSource }
+      - dv/verilator/reference_system_verilator_lint.vlt:  { file_type: vlt }
+
+  files_simulation:
+    files:
+      - rtl/papabench/papabench_stim.svh: { is_include_file: true }
+      - rtl/papabench/papabench_env.sv
+      - rtl/papabench/papabench_pwm_monitor.sv
+      - rtl/papabench/papabench_dual.sv
+    file_type: systemVerilogSource
+
+parameters:
+  PRIM_DEFAULT_IMPL:
+    datatype: str
+    paramtype: vlogdefine
+    description: Primitives implementation to use, e.g. "prim_pkg::ImplGeneric".
+
+targets:
+  default: &default_target
+    filesets:
+      - files_rtl
+
+  sim_ibex:
+    <<: *default_target
+    default_tool: verilator
+    filesets_append:
+      - files_verilator
+      - files_simulation
+    toplevel: papabench_dual
+    tools:
+      verilator:
+        mode: cc
+        verilator_options:
+          - '--trace'
+          - '--trace-fst' # this requires -DVM_TRACE_FMT_FST in CFLAGS below!
+          - '--trace-structs'
+          - '--trace-params'
+          - '--trace-max-array 1024'
+          - '-CFLAGS "-std=c++11 -Wall -DVM_TRACE_FMT_FST -DTOPLEVEL_NAME=papabench_dual"'
+          - '-LDFLAGS "-pthread -lutil -lelf"'
+          - "-Wall"
+          - "-Wwarn-IMPERFECTSCH"
+          - "-Wno-fatal"
+          - "--unroll-count 72"
+    parameters:
+      - PRIM_DEFAULT_IMPL=prim_pkg::ImplGeneric

@@ -16,19 +16,24 @@
 From `papabench_ibex/`:
 
 - `make PROG=fbw` / `make PROG=autopilot` / `make all-progs` → `build/<prog>/<prog>.elf` (+ `.map`, `instrumented.txt`, `exclude.txt`).
-- `make PROG=<prog> run` → runs the simulator in `build/<prog>/` and prints `reference_system.log` (the results). Simulator stdout (statistics, performance counters) is in `sim.log`.
-- Variables: `TICKS=<n>` (scheduler ticks, default 61; the Autopilot adds 30 startup ticks), `TICK_CYCLES=<n>` (timer period, default 819200), `OPT=-O2` etc., `SIM=<path>`, `MEASURE=0` (no instrumentation, no calibration, no timing in the IRQ wrappers, output only header `,measure=0` + `END`; objects in `build/<prog>-nomeasure/`, so the two builds never mix).
-- Simulator: default `SIM` is `papabench_ibex/build/sim/sim_ibex-verilator/Vreference_system`, built from the `Secure-Ibex/` submodule sources plus `papabench_ibex/hw/patches/*.patch` (applied to a copy in `build/sim/hw/`, see `ibex-platform.md` → SoC patches) by `make sim` (which also stages `hw/rtl/` and regenerates `papabench_stim.svh` with `hw/stimulus/gen_stimulus.py`: any change there, or to `hw/patches/`, needs `make sim`; `run` only builds the simulator when it is missing) with FuseSoC `--build-root`, so nothing is written inside the submodule. `make sim` needs the FuseSoC venv **activated** (the Secure-Ibex pre-build check runs `pip3 show edalize` from `PATH`) and Verilator 5.014/5.017 (5.014 installed). A venv exists at `~/01_Progetti_PC/Secure-Ibex/.venv` (sibling clone): `source ~/01_Progetti_PC/Secure-Ibex/.venv/bin/activate`. `FUSESOC=<path>` overrides the executable. `make distclean` also deletes the simulator.
-- Wall time with defaults: FBW ~1.5 min (50 M cycles), Autopilot ~2 min (75 M cycles); the two can run in parallel. For a quick check use e.g. `TICKS=10 TICK_CYCLES=20000`.
+- `make PROG=<prog> run` → single-MCU run (other MCU virtual): runs the simulator in `build/<prog>/` and prints `reference_system.log` (the results). Simulator stdout (statistics, performance counters) is in `sim.log`.
+- `make run-joint` → joint run: builds both programs with `JOINT=1` (FBW with `TICKS` + 30), runs `Vpapabench_dual` in `build/joint/` and prints `fbw.log` + `autopilot.log`; `sim.log`, `pwm.log` (FBW) there too. A `JOINT=1` ELF never ends on the single-MCU simulator: `make run` refuses `JOINT=1`.
+- Variables: `TICKS=<n>` (scheduler ticks, default 61; the Autopilot adds 30 startup ticks), `TICK_CYCLES=<n>` (timer period, default 819200), `OPT=-O2` etc., `SIM=<path>`, `SIM_DUAL=<path>`, `MEASURE=0` (no instrumentation, no calibration, no timing in the IRQ wrappers, output only header `,measure=0` + `link,` lines + `END`; objects in `build/<prog>[-joint]-nomeasure/`, so the builds never mix), `JOINT=1` (build for the two-MCU model, `build/<prog>-joint/`).
+- Simulator: default `SIM` is `papabench_ibex/build/sim/sim_ibex-verilator/Vreference_system`, built from the `Secure-Ibex/` submodule sources plus `papabench_ibex/hw/patches/*.patch` (applied to a copy in `build/sim/hw/`, see `ibex-platform.md` → SoC patches) by `make sim` (which also stages `hw/rtl/` and regenerates `papabench_stim.svh` with `hw/stimulus/gen_stimulus.py`: any change there, or to `hw/patches/`, needs `make sim` and `make sim-dual`; `run`/`run-joint` only build their simulator when it is missing; `make sim-dual` builds the two-MCU model into `build/sim-dual/` from the same staging) with FuseSoC `--build-root`, so nothing is written inside the submodule. `make sim` needs the FuseSoC venv **activated** (the Secure-Ibex pre-build check runs `pip3 show edalize` from `PATH`) and Verilator 5.014/5.017 (5.014 installed). A venv exists at `~/01_Progetti_PC/Secure-Ibex/.venv` (sibling clone): `source ~/01_Progetti_PC/Secure-Ibex/.venv/bin/activate`. `FUSESOC=<path>` overrides the executable. `make distclean` also deletes the simulator.
+- Wall time with defaults: FBW ~1.5 min (50 M cycles), Autopilot ~2 min (75 M cycles), joint ~4.5 min (75 M cycles on each of two cores, ~0.28 M cycles/s); they can run in parallel, except two runs of the same build directory (e.g. `PROG=autopilot run` with different `TICKS`: both write `build/autopilot/`). For a quick check use e.g. `TICKS=10 TICK_CYCLES=20000`.
 - Debug: `make PROG=<prog> disassemble` → `build/<prog>/<prog>.dis`; run the simulator by hand with `-t` for a waveform. An exception prints `EXCEPTION!!!` with `MEPC`/`MCAUSE`/`MTVAL` in `reference_system.log` and halts.
 - `make PROG=<prog> vmem` produces a `.vmem` image (not needed by Verilator).
 
 Output format (`reference_system.log`):
 
 ```
-PAPABENCH,<prog>,ticks=<n>,startup_ticks=<s>,tick_cycles=<c>
+PAPABENCH,<prog>,ticks=<n>,startup_ticks=<s>,tick_cycles=<c>[,measure=0][,joint=1]
 overhead,<cycles>
 task,<name>,<count>,<min>,<max>,<avg>
+trap_overhead,<cycles>
+isr_overhead,<cycles>
+isr,<name>,<count>,<min>,<max>,<avg>
+link,<counter>,<value>
 END
 ```
 

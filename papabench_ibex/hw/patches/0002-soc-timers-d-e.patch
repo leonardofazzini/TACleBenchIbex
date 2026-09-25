@@ -1,16 +1,15 @@
 Secure-Ibex SoC patch (PapaBench on Ibex): TimerD at 0x80040000 on
 irq_fast[6] (mip bit 22), TimerE at 0x80050000 on irq_fast[7] (mip bit 23),
-same timer.sv as the others; gp_i[1] becomes a second GPIO interrupt line on
-irq_fast[5] (mip bit 21), level-sensitive like gp_i[0]. With them no
-peripheral serves two different functions across the PapaBench programs.
-Applied by 'make sim' after 0001, to a copy under build/sim/hw/ (patch -p1);
-the Secure-Ibex submodule itself is never modified.
+same timer.sv as the others. With them no timer serves two different
+functions across the PapaBench programs. IRQ 20/21 belong to the
+Secure-Ibex SPI master/slave.
+Applied by 'make sim' after 0001, to a copy under build/sim/hw/ (patch -p1).
 
 --- a/rtl/system/reference_system_core.sv
 +++ b/rtl/system/reference_system_core.sv
-@@ -75,6 +75,16 @@
-   localparam logic [31:0] TIMERC_START  = 32'h80030000;
-   localparam logic [31:0] TIMERC_MASK   = ~(TIMERC_SIZE-1);
+@@ -104,6 +104,16 @@
+   localparam logic [31:0] SPIS_START    = 32'h80005000;   // SPI slave
+   localparam logic [31:0] SPIS_MASK     = ~(SPIS_SIZE-1);
  
 +  //@note PapaBench-on-Ibex patch: TimerD and TimerE, so that no timer serves
 +  //@note two different functions across the PapaBench programs.
@@ -22,37 +21,37 @@ the Secure-Ibex submodule itself is never modified.
 +  localparam logic [31:0] TIMERE_START  = 32'h80050000;
 +  localparam logic [31:0] TIMERE_MASK   = ~(TIMERE_SIZE-1);
 +
-   localparam logic [31:0] DEBUG_START   = 32'h1a110000;
-   localparam logic [31:0] DEBUG_SIZE    = 64 * 1024; // 64 KiB
-   localparam logic [31:0] DEBUG_MASK    = ~(DEBUG_SIZE-1);
-@@ -114,11 +124,13 @@
-     TimerA,
+   parameter logic [31:0] SIM_CTRL_SIZE  = 1 * 1024; // 1kB
+   parameter logic [31:0] SIM_CTRL_START = 32'h20000;
+   parameter logic [31:0] SIM_CTRL_MASK  = ~(SIM_CTRL_SIZE-1);
+@@ -128,11 +138,13 @@
      TimerB,
-     TimerC,
+     SpiM,
+     SpiS,
 +    TimerD,
 +    TimerE,
      SimCtrl,
      DbgDev
    } bus_device_e;
  
--  localparam int NrDevices = DBG ? 10 : 9;
-+  localparam int NrDevices = DBG ? 12 : 11;
+-  localparam int NrDevices = DBG ? 11 : 10;
++  localparam int NrDevices = DBG ? 13 : 12;
    localparam int NrHosts = DBG ? 2 : 1;
  
    // interrupts
-@@ -126,6 +138,8 @@
-   logic timer_a_irq;   // App1 tick timer (TimerA)
-   logic timer_b_irq;   // App2 tick timer (TimerB)
-   logic timer_c_irq;   // TimerC (PapaBench patch)
+@@ -142,6 +154,8 @@
+   logic uart_irq;
+   logic spi_m_irq;     // SPI master
+   logic spi_s_irq;     // SPI slave
 +  logic timer_d_irq;   // TimerD (PapaBench patch)
 +  logic timer_e_irq;   // TimerE (PapaBench patch)
-   logic uart_irq;
  
    // host and device signals
-@@ -195,6 +209,10 @@
-   assign cfg_device_addr_mask[TimerB]  = TIMERB_MASK;
-   assign cfg_device_addr_base[TimerC]  = TIMERC_START;
-   assign cfg_device_addr_mask[TimerC]  = TIMERC_MASK;
+   logic           host_req      [NrHosts];
+@@ -212,6 +226,10 @@
+   assign cfg_device_addr_mask[SpiM]    = SPIM_MASK;
+   assign cfg_device_addr_base[SpiS]    = SPIS_START;
+   assign cfg_device_addr_mask[SpiS]    = SPIS_MASK;
 +  assign cfg_device_addr_base[TimerD]  = TIMERD_START;
 +  assign cfg_device_addr_mask[TimerD]  = TIMERD_MASK;
 +  assign cfg_device_addr_base[TimerE]  = TIMERE_START;
@@ -60,30 +59,29 @@ the Secure-Ibex submodule itself is never modified.
    assign cfg_device_addr_base[SimCtrl] = SIM_CTRL_START;
    assign cfg_device_addr_mask[SimCtrl] = SIM_CTRL_MASK;
  
-@@ -284,6 +302,9 @@
-     core_irq[18]  = timer_a_irq;                 // App1 tick timer (TimerA)
+@@ -304,6 +322,8 @@
      core_irq[19]  = timer_b_irq;                 // App2 tick timer (TimerB)
-     core_irq[20]  = timer_c_irq;                 // TimerC (PapaBench patch)
-+    core_irq[21]  = gp_i[1];                     // second GPIO line (PapaBench patch)
+     core_irq[20]  = spi_m_irq;                   // SPI master
+     core_irq[21]  = spi_s_irq;                   // SPI slave
 +    core_irq[22]  = timer_d_irq;                 // TimerD (PapaBench patch)
 +    core_irq[23]  = timer_e_irq;                 // TimerE (PapaBench patch)
    end
  
    cv32e40p_top #(
-@@ -397,7 +418,10 @@
+@@ -417,7 +437,10 @@
+       //@note The FreeRTOS SW-cost experiments need the two timers OR'd onto irq_fast_i[2] alone
        //@note instead (see sw/Smtctx_Only_SW/MMU_SW_Cost/freertos/README.md):
-       //@note   .irq_fast_i ({12'b0, (timer_a_irq | timer_b_irq), gp_i[0], uart_irq}),
-       //@note irq_fast_i[4] = TimerC (mip bit 20), PapaBench patch.
--    .irq_fast_i    ({10'b0, timer_c_irq, timer_b_irq, timer_a_irq, gp_i[0], uart_irq}),
-+      //@note irq_fast_i[5] = gp_i[1] (mip bit 21), irq_fast_i[6] = TimerD (mip bit 22),
-+      //@note irq_fast_i[7] = TimerE (mip bit 23), PapaBench patch.
-+    .irq_fast_i    ({7'b0, timer_e_irq, timer_d_irq, gp_i[1], timer_c_irq, timer_b_irq,
-+                     timer_a_irq, gp_i[0], uart_irq}),
+       //@note   .irq_fast_i ({9'b0, spi_s_irq, spi_m_irq, 1'b0, (timer_a_irq | timer_b_irq), gp_i[0], uart_irq}),
+-    .irq_fast_i    ({9'b0, spi_s_irq, spi_m_irq, timer_b_irq, timer_a_irq, gp_i[0], uart_irq}),
++      //@note irq_fast_i[6] = TimerD (mip bit 22), irq_fast_i[7] = TimerE (mip bit 23),
++      //@note PapaBench patch.
++    .irq_fast_i    ({7'b0, timer_e_irq, timer_d_irq, spi_s_irq, spi_m_irq,
++                     timer_b_irq, timer_a_irq, gp_i[0], uart_irq}),
      .irq_nm_i      (1'b0),
  
      .scramble_key_valid_i('0),
-@@ -594,6 +618,44 @@
-     .timer_intr_o  (timer_c_irq)
+@@ -633,6 +656,44 @@
+     .timer_intr_o  (timer_b_irq)
    );
  
 +  // TimerD @ 0x80040000 -> irq_fast[6] (PapaBench patch)

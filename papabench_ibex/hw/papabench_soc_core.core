@@ -13,12 +13,14 @@ filesets:
     files:
       - rtl/system/reference_system_core.sv
       - rtl/system/debounce.sv
-      - rtl/system/gpio.sv
+      # GPIO banks with edge interrupts, in place of gpio.sv (hw/rtl/,
+      # hw/patches/0003)
+      - rtl/papabench/papabench_gpio.sv
       - rtl/system/pwm.sv
       - rtl/system/pwm_wrapper.sv
       - rtl/system/uart.sv
-      - rtl/system/spi_host.sv
-      - rtl/system/spi_top.sv
+      - rtl/system/spi_master.sv
+      - rtl/system/spi_slave.sv
     file_type: systemVerilogSource
 
   files_dbg_sim:

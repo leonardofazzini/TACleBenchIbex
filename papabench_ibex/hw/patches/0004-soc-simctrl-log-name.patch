@@ -1,0 +1,29 @@
+Secure-Ibex SoC patch (PapaBench on Ibex): the file written by the
+simulator control (SimCtrl) becomes a parameter of reference_system_core
+(default "reference_system.log", as before), so that the two SoC instances
+of the joint FBW + Autopilot simulation (hw/rtl/papabench_dual.sv) each
+write their own.
+Applied by 'make sim' after 0003, to a copy under build/sim/hw/ (patch -p1).
+
+--- a/rtl/system/reference_system_core.sv
++++ b/rtl/system/reference_system_core.sv
+@@ -27,6 +27,10 @@
+   //@note PapaBench-on-Ibex patch: PWM counter width is a parameter (was a
+   //@note localparam fixed at 8 bits); the default keeps the original width.
+   parameter int PwmCtrSize   = 8,
++  //@note PapaBench-on-Ibex patch: file written by the simulator control
++  //@note (SimCtrl), so that two SoC instances in one simulation (FBW and
++  //@note Autopilot MCUs) do not share it; the default keeps the original name.
++  parameter string SimCtrlLogName = "reference_system.log",
+   parameter     SRAMInitFile = ""
+ ) (
+   input logic                 clk_sys_i,
+@@ -627,7 +631,7 @@
+ 
+   `ifdef VERILATOR
+     simulator_ctrl #(
+-      .LogName("reference_system.log")
++      .LogName(SimCtrlLogName)
+     ) u_simulator_ctrl (
+       .clk_i     (clk_sys_i),
+       .rst_ni    (rst_sys_ni),

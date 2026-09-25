@@ -1,7 +1,7 @@
 /*
   Generic part of the AVR peripheral models (see periph.h): event channels on
-  TimerA..E, Timer1 compare arithmetic, timer counters, GPIO output shadow,
-  the SPDR double register. Compiled with the PapaBench flags of the program
+  TimerA, B, D, E, Timer1 compare arithmetic, timer counters, GPIO output
+  shadow, the SPDR double register and its bridge to the SPI TX FIFOs. Compiled with the PapaBench flags of the program
   being built, but uses no AVR register name, so it is the same for both.
 */
 
@@ -10,7 +10,6 @@
 
 struct pb_timer pb_timer_a = { IBEX_TIMER_A };
 struct pb_timer pb_timer_b = { IBEX_TIMER_B };
-struct pb_timer pb_timer_c = { IBEX_TIMER_C };
 struct pb_timer pb_timer_d = { IBEX_TIMER_D };
 struct pb_timer pb_timer_e = { IBEX_TIMER_E };
 
@@ -88,12 +87,6 @@ void papabench_irq_timer_a( void )
 void papabench_irq_timer_b( void )
 {
   pb_timer_irq( &pb_timer_b );
-}
-
-
-void papabench_irq_timer_c( void )
-{
-  pb_timer_irq( &pb_timer_c );
 }
 
 
@@ -175,14 +168,27 @@ static unsigned int pb_gpo;
 void pb_gpo_write( unsigned int mask, unsigned int value )
 {
   pb_gpo = ( pb_gpo & ~mask ) | ( value & mask );
-  IBEX_REG( IBEX_GPIO + IBEX_GPIO_OUT ) = pb_gpo;
+  IBEX_REG( papabench_gpio + IBEX_GPIO_OUT ) = pb_gpo;
 }
 
 
 void pb_gpo_toggle( unsigned int mask )
 {
   pb_gpo ^= mask;
-  IBEX_REG( IBEX_GPIO + IBEX_GPIO_OUT ) = pb_gpo;
+  IBEX_REG( papabench_gpio + IBEX_GPIO_OUT ) = pb_gpo;
+}
+
+
+void pb_gpio_init( void )
+{
+  IBEX_REG( papabench_gpio + IBEX_GPIO_IRQ_FALL ) = PB_GPI_LINE;
+  IBEX_REG( papabench_gpio + IBEX_GPIO_IRQ_EN ) = PB_GPI_LINE;
+}
+
+
+void papabench_periph_done( void )
+{
+  pb_gpo_write( PB_GPO_DONE, PB_GPO_DONE );
 }
 
 
@@ -190,16 +196,37 @@ void pb_gpo_toggle( unsigned int mask )
 
 volatile unsigned char papabench_spdr_rx;
 volatile unsigned int papabench_spdr_accesses;
+unsigned int pb_spdr_dropped;
 
-static volatile unsigned char pb_spdr_slot[ 4 ];
-static unsigned int pb_spdr_next;
+static volatile unsigned char pb_spdr_slot[ PB_SPDR_SLOTS ];
 
 
 volatile unsigned char *papabench_spdr_access( void )
 {
-  volatile unsigned char *p = &pb_spdr_slot[ pb_spdr_next++ & 3 ];
+  volatile unsigned char *p =
+    &pb_spdr_slot[ papabench_spdr_accesses % PB_SPDR_SLOTS ];
 
   *p = papabench_spdr_rx;
   papabench_spdr_accesses++;
   return p;
+}
+
+
+void pb_spdr_flush( unsigned int *seen, int last_is_read,
+                    unsigned int spi_base )
+{
+  unsigned int end = papabench_spdr_accesses;
+
+  if ( last_is_read && end != *seen )
+    end--;
+  for ( ; *seen != end; ( *seen )++ ) {
+    if ( !spi_base )
+      continue;
+    if ( !( IBEX_REG( spi_base + IBEX_SPI_STATUS ) & IBEX_SPI_TX_EMPTY ) )
+      pb_spdr_dropped++;
+    else
+      IBEX_REG( spi_base + IBEX_SPI_TXDATA ) =
+        pb_spdr_slot[ *seen % PB_SPDR_SLOTS ];
+  }
+  *seen = papabench_spdr_accesses;
 }

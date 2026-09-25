@@ -32,18 +32,25 @@
 
   After PAPABENCH_TICKS scheduler ticks (plus the program's startup ticks)
   the ISR prints the results on SimCtrl and halts the simulation:
-    PAPABENCH,<prog>,ticks=<n>,startup_ticks=<s>,tick_cycles=<c>
+    PAPABENCH,<prog>,ticks=<n>,startup_ticks=<s>,tick_cycles=<c>[,joint=1]
     overhead,<cycles>
     task,<name>,<count>,<min>,<max>,<avg>
     trap_overhead,<cycles>
     isr_overhead,<cycles>
     isr,<name>,<count>,<min>,<max>,<avg>
+    link,<counter>,<value>
     END
+  The link lines are the model's SPI-link counters (papabench_periph_report).
+  In the joint run (PAPABENCH_JOINT=1, two MCUs) the program does not halt
+  the simulation, which would stop the other MCU too: it signals that it is
+  done (papabench_periph_done()) and keeps running, serving the SPI link;
+  the simulation ends when both MCUs are done.
 
   With PAPABENCH_MEASURE=0 (make MEASURE=0) nothing is timed: no hooks (the
   PapaBench objects are not instrumented), no calibration, the wrappers only
   dispatch and synchronise the models. Same scenario, same stop after the
-  ticks; the output is the header line (with ",measure=0") and END.
+  ticks; the output is the header line (with ",measure=0"), the link lines
+  and END.
 */
 
 #include "reference_system_common.h"
@@ -63,6 +70,10 @@
 #define PAPABENCH_MEASURE 1
 #endif
 
+#ifndef PAPABENCH_JOINT
+#define PAPABENCH_JOINT 0
+#endif
+
 #define PAPABENCH_MAX_TASKS 16
 #define HARNESS_CALIB PAPABENCH_MAX_TASKS
 #define PAPABENCH_MAX_ISRS 8
@@ -75,6 +86,8 @@ const unsigned int papabench_tick_cycles = PAPABENCH_TICK_CYCLES;
 
 static volatile uint32_t harness_ticks;
 static uint64_t harness_timecmp;
+/* Results printed (joint run: the program keeps running afterwards) */
+static unsigned char harness_done;
 
 /* Dispatcher of each interrupt (mcause number), for harness_irq */
 static papabench_fn_t harness_dispatch[ 32 ];
@@ -208,13 +221,23 @@ static void harness_putdec( uint32_t v )
 }
 
 
-#if PAPABENCH_MEASURE
 static void harness_field( uint32_t v )
 {
   putchar( ',' );
   harness_putdec( v );
 }
 
+
+void papabench_report_value( const char *name, unsigned int value )
+{
+  puts( "link," );
+  puts( name );
+  harness_field( value );
+  putchar( '\n' );
+}
+
+
+#if PAPABENCH_MEASURE
 
 static void harness_stat_line( const char *kind, const char *name,
                                const struct harness_stat *s )
@@ -250,11 +273,13 @@ static void harness_report( void )
   putchar( '\n' );
   for ( t = 0; t < papabench_nisrs; t++ )
     harness_stat_line( "isr,", papabench_isrs[ t ].name, &harness_isr_stat[ t ] );
+  papabench_periph_report();
   puts( "END\n" );
 }
 #else
 static void harness_report( void )
 {
+  papabench_periph_report();
   puts( "END\n" );
 }
 #endif
@@ -270,11 +295,17 @@ static void __attribute__( ( noinline ) ) harness_tick( void )
   timecmp_update( harness_timecmp );
   papabench_tick_pending = 1;
 
-  if ( ++harness_ticks >= PAPABENCH_TICKS + papabench_startup_ticks ) {
+  if ( !harness_done &&
+       ++harness_ticks >= PAPABENCH_TICKS + papabench_startup_ticks ) {
+    harness_done = 1;
     harness_report();
+#if PAPABENCH_JOINT
+    papabench_periph_done();
+#else
     sim_halt();
     while ( 1 )
       ;
+#endif
   }
 }
 
@@ -428,6 +459,9 @@ int main( void )
   harness_putdec( PAPABENCH_TICK_CYCLES );
 #if !PAPABENCH_MEASURE
   puts( ",measure=0" );
+#endif
+#if PAPABENCH_JOINT
+  puts( ",joint=1" );
 #endif
   putchar( '\n' );
 

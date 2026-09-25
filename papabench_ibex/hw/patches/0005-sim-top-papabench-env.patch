@@ -1,0 +1,62 @@
+Secure-Ibex SoC patch (PapaBench on Ibex): the Verilator top instantiates
+papabench_env (hw/rtl/papabench_env.sv), which drives the inputs of both GPIO
+banks and uart_rx with deterministic stimuli (radio PPM on bank 0, modem
+clock on bank 1, GPS UBX), each started by its program through its own bank.
+The UART DPI keeps receiving the UART TX (uart0.log) but no longer drives RX.
+The SPI master -> SPI slave loopback of the upstream top is kept.
+Applied by 'make sim' after 0004, to a copy under build/sim/hw/ (patch -p1).
+
+--- a/rtl/top_simulation/reference_system.sv
++++ b/rtl/top_simulation/reference_system.sv
+@@ -31,6 +31,12 @@
+   //UART signals
+   logic uart_rx;
+   logic uart_tx;
++  // PapaBench-on-Ibex patch: uart_rx and the inputs of both GPIO banks come
++  // from the deterministic environment (papabench_env); the UART DPI only
++  // receives (uart0.log). GPIO bank 0 is the FBW's, bank 1 the Autopilot's.
++  logic uart_dpi_tx_unused;
++  logic [GpiWidth-1:0] gp1_i;
++  logic [GpoWidth-1:0] gp1_o;
+   //SPI loopback: the SoC's SPI master drives its own SPI slave
+   logic spi_sck;
+   logic spi_cs_n;
+@@ -61,10 +67,12 @@
+     .clk_sys_i,
+     .rst_sys_ni,
+     .gp_i,
++    .gp1_i,
+     .uart_rx_i(uart_rx),
+ 
+     //output
+     .gp_o,
++    .gp1_o,
+     .pwm_o,
+     .uart_tx_o(uart_tx),
+     //SPI master -> SPI slave loopback (MISO pulled up when the slave does not drive it)
+@@ -96,6 +104,16 @@
+   assign  dmi_rsp_data=dmi_resp_debug_side.data;
+   assign  dmi_rsp_resp=dmi_resp_debug_side.resp;
+ 
++  papabench_env u_papabench_env (
++    .clk_i     (clk_sys_i),
++    .rst_ni    (rst_sys_ni),
++    .fbw_gpo_i (gp_o),
++    .fbw_gpi_o (gp_i),
++    .ap_gpo_i  (gp1_o),
++    .ap_gpi_o  (gp1_i),
++    .uart_rx_o (uart_rx)
++  );
++
+   //UART dpi interface
+   uartdpi #(//@audit-info inizializzazione della uart nel simple-system
+       .BAUD('d115_200),
+@@ -105,7 +123,7 @@
+       .clk_i          (clk_sys_i),
+       .rst_ni         (rst_sys_ni),
+       .active         (1'b1),
+-      .tx_o           (uart_rx),
++      .tx_o           (uart_dpi_tx_unused),
+       .rx_i           (uart_tx)
+   );
+   //Debugger dpi interface

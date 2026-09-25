@@ -69,6 +69,15 @@ void papabench_isr_run( unsigned int id, papabench_fn_t fn );
 void papabench_periph_init( void );
 /* Program model: synchronisation point, called with interrupts disabled */
 void papabench_periph_poll( void );
+/* Program model: prints its link counters (papabench_report_value), before
+   END */
+void papabench_periph_report( void );
+/* periph.c: joint run only, the program has printed its results (gp_o[7]
+   of its GPIO bank); the simulation ends when both MCUs have called it */
+void papabench_periph_done( void );
+
+/* harness.c: prints "link,<name>,<value>" */
+void papabench_report_value( const char *name, unsigned int value );
 
 /*
   Ibex interrupts owned by the program's model (see the peripheral map in

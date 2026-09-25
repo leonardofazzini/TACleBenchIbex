@@ -8,16 +8,26 @@
 #                            same scenario, no measurement: no hooks, no
 #                            calibration, no results (build/fbw-nomeasure/)
 #   make all-progs           build both
-#   make sim                 build the Verilator simulator into build/sim/ from
-#                            the Secure-Ibex sources + hw/patches (done by 'run'
-#                            if missing)
+#   make run-joint           build both with JOINT=1 and run them at the same
+#                            time on two Ibex MCUs linked by SPI (results
+#                            printed from build/joint/{fbw,autopilot}.log)
+#   make sim                 build the single-MCU Verilator simulator into
+#                            build/sim/ from the Secure-Ibex sources +
+#                            hw/patches (done by 'run' if missing)
+#   make sim-dual            build the two-MCU simulator (hw/rtl/
+#                            papabench_dual.sv) into build/sim-dual/ (done by
+#                            'run-joint' if missing)
 #   make PROG=fbw vmem       also produce a .vmem image (not needed by Verilator)
-#   make hwtest              smoke test of the SoC patches (TimerC/D/E IRQ
-#                            20/22/23, gp_i[1] IRQ 21, 20-bit PWM, pwm.log)
-#                            on the simulator, with a waveform
+#   make hwtest              smoke test of the SoC patches (TimerD/E IRQ 22/23,
+#                            GPIO banks 0/1 edge IRQ 17/24, 20-bit PWM,
+#                            pwm.log) on the
+#                            single-MCU simulator, with a waveform
 #
 # Each program runs its own upstream scheduler; its time base is the Ibex
 # machine timer (0x80000000, IRQ 7), one tick every TICK_CYCLES cycles.
+# In a single-MCU run ('run') the other MCU of the SPI link is virtual (played
+# by the program's model on the SoC's other SPI end, looped back on chip); in
+# the joint run both programs are real.
 #
 # Variables:
 #   TICKS        scheduler ticks to run before printing results (default 61,
@@ -32,10 +42,16 @@
 #   MEASURE      1 (default): per-task and per-ISR mcycle measurement;
 #                0: the program just runs (plain objects, harness without
 #                timing), still stopped after TICKS ticks
+#   JOINT        0 (default): single-MCU build, virtual other MCU;
+#                1: build for the two-MCU simulator (build/<prog>-joint/),
+#                set by 'run-joint'
+#   SIM_DUAL     path to Vpapabench_dual (default: the one 'make sim-dual'
+#                builds)
 #
 # Nothing is written under bench/ or Secure-Ibex/: sources are read from
-# there, objects go to build/<prog>/, the simulator to build/sim/. SoC hardware
-# changes are patches (hw/patches/) applied to a copy in build/sim/hw/.
+# there, objects go to build/<prog>[-joint][-nomeasure]/, the simulators to
+# build/sim/ and build/sim-dual/. SoC hardware changes are patches
+# (hw/patches/) applied to a copy in build/sim/hw/.
 
 .DEFAULT_GOAL := all
 
@@ -44,6 +60,7 @@ TICKS       ?= 61
 TICK_CYCLES ?= 819200
 OPT         ?= -Os
 MEASURE     ?= 1
+JOINT       ?= 0
 
 HERE        := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 ROOT        := $(abspath $(HERE)/..)
@@ -56,13 +73,13 @@ IBEX_CRT    := $(IBEX_SW)/hello_test/crt0.S
 LINKER_SCRIPT ?= $(HERE)/link.ld
 SIM_DEFAULT := $(HERE)/build/sim/sim_ibex-verilator/Vreference_system
 SIM ?= $(SIM_DEFAULT)
+SIM_DUAL_DEFAULT := $(HERE)/build/sim-dual/sim_ibex-verilator/Vpapabench_dual
+SIM_DUAL ?= $(SIM_DUAL_DEFAULT)
 FUSESOC ?= fusesoc
 
-ifeq ($(MEASURE),0)
-BUILD := $(HERE)/build/$(PROG)-nomeasure
-else
-BUILD := $(HERE)/build/$(PROG)
-endif
+# build/<prog>[-joint][-nomeasure]
+VARIANT := $(if $(filter 1,$(JOINT)),-joint)$(if $(filter 0,$(MEASURE)),-nomeasure)
+BUILD := $(HERE)/build/$(PROG)$(VARIANT)
 ELF   := $(BUILD)/$(PROG).elf
 
 CC      := riscv32-unknown-elf-gcc
@@ -83,13 +100,13 @@ BASE_CFLAGS := $(ARCH_FLAGS) $(OPT) -g -static -ffreestanding -nostdlib \
 # PAPABENCH_TICK_BIT = TOV2 (6 on both devices)
 # PAPABENCH_SPDR_ADDR = SPDR = _SFR_IO8(0x0F) on both devices
 PB_CFLAGS := $(BASE_CFLAGS) -fcommon -fgnu89-inline -Wno-unknown-pragmas \
-  -DPAPABENCH_TICK_BIT=6 -DPAPABENCH_SPDR_ADDR=0x2F \
+  -DPAPABENCH_TICK_BIT=6 -DPAPABENCH_SPDR_ADDR=0x2F -DPAPABENCH_JOINT=$(JOINT) \
   -I$(HERE)/include -I$(PB)/sw/include -I$(PB)/sw/var/include
 
 # Ibex side: Secure-Ibex common library + harness
 IBEX_CFLAGS := $(BASE_CFLAGS) -I$(IBEX_COMMON) -I$(HERE)/harness \
   -DPAPABENCH_TICKS=$(TICKS) -DPAPABENCH_TICK_CYCLES=$(TICK_CYCLES) \
-  -DPAPABENCH_MEASURE=$(MEASURE)
+  -DPAPABENCH_MEASURE=$(MEASURE) -DPAPABENCH_JOINT=$(JOINT)
 
 LDFLAGS := $(ARCH_FLAGS) -static -nostdlib -nostartfiles -Wl,--gc-sections \
   -T $(LINKER_SCRIPT) -Wl,-Map=$(BUILD)/$(PROG).map
@@ -209,7 +226,7 @@ vpath %.c $(sort $(dir $(PB_SRCS)))
 
 # ------------------------------------------------------------------ rules ---
 
-.PHONY: all all-progs sim vmem run disassemble clean distclean
+.PHONY: all all-progs sim sim-dual vmem run run-joint disassemble clean distclean
 
 all: $(ELF)
 	@$(SIZE) $(ELF)
@@ -289,42 +306,62 @@ $(BUILD)/harness/harness.o: $(HERE)/harness/harness.c FORCE
 FORCE: ;
 .PHONY: FORCE
 
-# Standard-Ibex Verilator model (FuseSoC target sim_ibex) with the PapaBench
+# Standard-Ibex Verilator models (FuseSoC target sim_ibex) with the PapaBench
 # SoC patches. SOC_FILES are copied from the submodule into HW_STAGE, the
-# patches in hw/patches/ are applied there in name order, our environment
-# (hw/rtl/) and its stimulus tables (generated by hw/stimulus/
-# gen_stimulus.py) are added under rtl/papabench/, and our two cores
-# (hw/*.core: papabench:soc:reference_system[_core]) are built from it; the
-# rest (Ibex, bus, RAM, timer, DPI) comes unmodified from the submodule's
-# cores. --build-root keeps every output out of Secure-Ibex/. A patch that no
-# longer applies (submodule updated) stops the build. Rebuilt only by
-# 'make sim' or when missing.
+# patches in hw/patches/ are applied there in name order, our RTL (hw/rtl/:
+# GPIO banks, environment, PWM monitor, two-MCU top) and its stimulus
+# tables (generated by hw/stimulus/gen_stimulus.py) are added under
+# rtl/papabench/, the two-MCU testbench (hw/dv/) under dv/, and our cores
+# (hw/*.core) are built from it: papabench:soc:reference_system (one MCU,
+# 'sim') or papabench:soc:dual (two MCUs, 'sim-dual'), both on
+# papabench:soc:reference_system_core. The rest (Ibex, bus, RAM, timer, DPI)
+# comes unmodified from the submodule's cores. --build-root keeps every
+# output out of Secure-Ibex/. A patch that no longer applies (submodule
+# updated) stops the build. Rebuilt only by 'make sim'/'make sim-dual' or
+# when missing.
 HW_STAGE  := $(HERE)/build/sim/hw
 SOC_FILES := $(addprefix rtl/system/, reference_system_core.sv debounce.sv \
-  gpio.sv pwm.sv pwm_wrapper.sv uart.sv spi_host.sv spi_top.sv) \
+  pwm.sv pwm_wrapper.sv uart.sv spi_master.sv spi_slave.sv) \
   rtl/top_simulation/reference_system.sv \
   $(addprefix dv/verilator/, reference_system.cc reference_system.h \
   reference_system_main.cc reference_system_verilator_lint.vlt)
 HW_PATCHES := $(sort $(wildcard $(HERE)/hw/patches/*.patch))
 
-sim:
+define HW_STAGE_CMDS
 	rm -rf $(HW_STAGE)
 	mkdir -p $(HW_STAGE)
 	cd $(ROOT)/Secure-Ibex && cp --parents $(SOC_FILES) $(HW_STAGE)/
 	cp $(HERE)/hw/*.core $(HW_STAGE)/
-	mkdir -p $(HW_STAGE)/rtl/papabench
+	mkdir -p $(HW_STAGE)/rtl/papabench $(HW_STAGE)/dv
 	cp $(HERE)/hw/rtl/*.sv $(HW_STAGE)/rtl/papabench/
+	cp $(HERE)/hw/dv/*.cc $(HW_STAGE)/dv/
 	python3 $(HERE)/hw/stimulus/gen_stimulus.py \
 	  $(HW_STAGE)/rtl/papabench/papabench_stim.svh
 	for p in $(HW_PATCHES); do \
 	  echo "patch $$(basename $$p)"; \
 	  patch -s -p1 -N -d $(HW_STAGE) < $$p || exit 1; done
+endef
+
+# $(1): core, $(2): build root
+define HW_BUILD_CMDS
 	$(FUSESOC) --cores-root=$(ROOT)/Secure-Ibex --cores-root=$(HW_STAGE) \
-	  run --target=sim_ibex --setup --build --build-root=$(HERE)/build/sim \
-	  papabench:soc:reference_system --verilator_options=-Wno-fatal
+	  run --target=sim_ibex --setup --build --build-root=$(2) \
+	  $(1) --verilator_options=-Wno-fatal
+endef
+
+sim:
+	$(HW_STAGE_CMDS)
+	$(call HW_BUILD_CMDS,papabench:soc:reference_system,$(HERE)/build/sim)
+
+sim-dual:
+	$(HW_STAGE_CMDS)
+	$(call HW_BUILD_CMDS,papabench:soc:dual,$(HERE)/build/sim-dual)
 
 $(SIM_DEFAULT):
 	$(MAKE) sim
+
+$(SIM_DUAL_DEFAULT):
+	$(MAKE) sim-dual
 
 # Smoke test of the SoC patches (hw/test/hw_smoke.c). Runs with -t: the PWM
 # cannot be read back, so hw/test/check_pwm.sh measures its output on the
@@ -354,8 +391,29 @@ $(HWT)/hw_smoke.elf: $(HWT_SRCS) $(LINKER_SCRIPT)
 # reference_system.log (SimCtrl output = results), uart0.log (UART TX, unused
 # by both programs), pwm.log (PWM pulses: FBW servos), pcount CSV
 run: all $(SIM)
+ifeq ($(JOINT),1)
+	$(error JOINT=1 builds run on the two-MCU simulator: use 'make run-joint')
+endif
 	cd $(BUILD) && $(SIM) --meminit=ram,$(ELF) > sim.log 2>&1; \
 	  status=$$?; cat reference_system.log; exit $$status
+
+# Both programs at once on the two-MCU simulator. Each MCU's SimCtrl output
+# (its results) goes to fbw.log / autopilot.log; pwm.log = FBW servos. The
+# run ends when both programs have printed their results. FBW runs
+# AP_STARTUP_TICKS more ticks (the Autopilot's init wait,
+# autopilot_glue.c papabench_startup_ticks), so that both report at the same
+# tick and their results cover the same flight.
+AP_STARTUP_TICKS := 30
+JOINT_DIR := $(HERE)/build/joint$(if $(filter 0,$(MEASURE)),-nomeasure)
+JOINT_ELF = $(HERE)/build/$(1)-joint$(if $(filter 0,$(MEASURE)),-nomeasure)/$(1).elf
+
+run-joint: $(SIM_DUAL)
+	$(MAKE) PROG=fbw JOINT=1 TICKS=$$(( $(TICKS) + $(AP_STARTUP_TICKS) ))
+	$(MAKE) PROG=autopilot JOINT=1
+	@mkdir -p $(JOINT_DIR)
+	cd $(JOINT_DIR) && $(SIM_DUAL) --meminit=fbw,$(call JOINT_ELF,fbw) \
+	  --meminit=autopilot,$(call JOINT_ELF,autopilot) > sim.log 2>&1; \
+	  status=$$?; cat fbw.log autopilot.log; exit $$status
 
 clean:
 	rm -rf $(BUILD)

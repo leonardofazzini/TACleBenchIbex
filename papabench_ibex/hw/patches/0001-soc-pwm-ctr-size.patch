@@ -1,7 +1,8 @@
 Secure-Ibex SoC patch (PapaBench on Ibex): PWM counter width becomes a
 parameter of reference_system_core (default 8, as before) and the Verilator
 top sets it to 20 bits, enough for a 20 ms servo period at 50 MHz.
-Applied by 'make sim' after 0001, to a copy under build/sim/hw/ (patch -p1).
+Applied by 'make sim' first, to a copy under build/sim/hw/ (patch -p1); the
+Secure-Ibex submodule itself is never modified.
 
 --- a/rtl/system/reference_system_core.sv
 +++ b/rtl/system/reference_system_core.sv
@@ -15,14 +16,14 @@ Applied by 'make sim' after 0001, to a copy under build/sim/hw/ (patch -p1).
    parameter     SRAMInitFile = ""
  ) (
    input logic                 clk_sys_i,
-@@ -87,7 +90,6 @@
+@@ -92,7 +95,6 @@
    localparam logic [31:0] PWM_SIZE      =  4 * 1024; //  4 KiB
    localparam logic [31:0] PWM_START     = 32'h80003000;
    localparam logic [31:0] PWM_MASK      = ~(PWM_SIZE-1);
 -  localparam int PwmCtrSize = 8;
  
-   parameter logic [31:0] SIM_CTRL_SIZE  = 1 * 1024; // 1kB
-   parameter logic [31:0] SIM_CTRL_START = 32'h20000;
+   localparam logic [31:0] SPIM_SIZE     =  4 * 1024; //  4 KiB
+   localparam logic [31:0] SPIM_START    = 32'h80004000;   // SPI master
 --- a/rtl/top_simulation/reference_system.sv
 +++ b/rtl/top_simulation/reference_system.sv
 @@ -14,6 +14,9 @@
@@ -35,7 +36,7 @@ Applied by 'make sim' after 0001, to a copy under build/sim/hw/ (patch -p1).
    parameter     SRAMInitFile = ""
  ) (
    input logic                 clk_sys_i,
-@@ -45,6 +48,7 @@
+@@ -51,6 +54,7 @@
      .GpiWidth(GpiWidth),
      .GpoWidth(GpoWidth),
      .PwmWidth(PwmWidth),

@@ -1,0 +1,145 @@
+Secure-Ibex SoC patch (PapaBench on Ibex): two GPIO banks with edge
+interrupts, one per PapaBench program, so that the two programs share no
+GPIO register. Bank 0 stays at 0x80002000, bank 1 is at 0x80060000 with new
+ports gp1_i/gp1_o. Both are papabench_gpio (hw/rtl/papabench_gpio.sv): the
+gpio.sv register map plus IRQ_EN, IRQ_STATUS (write 1 to clear), IRQ_FALL
+and IRQ_RISE. Bank 0 drives irq_fast[1] (mip bit 17) in place of the raw
+gp_i[0] line, bank 1 irq_fast[8] (mip bit 24).
+Applied by 'make sim' after 0002, to a copy under build/sim/hw/ (patch -p1).
+
+--- a/rtl/system/reference_system_core.sv
++++ b/rtl/system/reference_system_core.sv
+@@ -34,6 +34,9 @@
+ 
+   input  logic [GpiWidth-1:0] gp_i,
+   output logic [GpoWidth-1:0] gp_o,
++  //@note PapaBench-on-Ibex patch: second GPIO bank (0x80060000, IRQ 24)
++  input  logic [GpiWidth-1:0] gp1_i,
++  output logic [GpoWidth-1:0] gp1_o,
+   output logic [PwmWidth-1:0] pwm_o,
+   input  logic                uart_rx_i,
+   output logic                uart_tx_o,
+@@ -114,6 +117,13 @@
+   localparam logic [31:0] TIMERE_START  = 32'h80050000;
+   localparam logic [31:0] TIMERE_MASK   = ~(TIMERE_SIZE-1);
+ 
++  //@note PapaBench-on-Ibex patch: two GPIO banks with edge interrupts
++  //@note (papabench_gpio.sv), one per PapaBench program: bank 0 at GPIO_START
++  //@note (IRQ 17), bank 1 here (IRQ 24).
++  localparam logic [31:0] GPIO1_SIZE    =  4 * 1024; //  4 KiB
++  localparam logic [31:0] GPIO1_START   = 32'h80060000;
++  localparam logic [31:0] GPIO1_MASK    = ~(GPIO1_SIZE-1);
++
+   parameter logic [31:0] SIM_CTRL_SIZE  = 1 * 1024; // 1kB
+   parameter logic [31:0] SIM_CTRL_START = 32'h20000;
+   parameter logic [31:0] SIM_CTRL_MASK  = ~(SIM_CTRL_SIZE-1);
+@@ -140,11 +150,12 @@
+     SpiS,
+     TimerD,
+     TimerE,
++    Gpio1,
+     SimCtrl,
+     DbgDev
+   } bus_device_e;
+ 
+-  localparam int NrDevices = DBG ? 13 : 12;
++  localparam int NrDevices = DBG ? 14 : 13;
+   localparam int NrHosts = DBG ? 2 : 1;
+ 
+   // interrupts
+@@ -156,6 +167,8 @@
+   logic spi_s_irq;     // SPI slave
+   logic timer_d_irq;   // TimerD (PapaBench patch)
+   logic timer_e_irq;   // TimerE (PapaBench patch)
++  logic gpio_irq;      // GPIO bank 0 (PapaBench patch)
++  logic gpio1_irq;     // GPIO bank 1 (PapaBench patch)
+ 
+   // host and device signals
+   logic           host_req      [NrHosts];
+@@ -230,6 +243,8 @@
+   assign cfg_device_addr_mask[TimerD]  = TIMERD_MASK;
+   assign cfg_device_addr_base[TimerE]  = TIMERE_START;
+   assign cfg_device_addr_mask[TimerE]  = TIMERE_MASK;
++  assign cfg_device_addr_base[Gpio1]   = GPIO1_START;
++  assign cfg_device_addr_mask[Gpio1]   = GPIO1_MASK;
+   assign cfg_device_addr_base[SimCtrl] = SIM_CTRL_START;
+   assign cfg_device_addr_mask[SimCtrl] = SIM_CTRL_MASK;
+ 
+@@ -242,6 +257,7 @@
+   // Tie-off unused error signals
+   assign device_err[Ram]     = 1'b0;
+   assign device_err[Gpio]    = 1'b0;
++  assign device_err[Gpio1]   = 1'b0;
+   assign device_err[Pwm]     = 1'b0;
+   assign device_err[Uart]    = 1'b0;
+   assign device_err[SpiM]    = 1'b0;
+@@ -317,13 +333,14 @@
+     core_irq      = 32'b0;
+     core_irq[7]   = timer_irq;
+     core_irq[16]  = uart_irq;
+-    core_irq[17]  = gp_i[0];
++    core_irq[17]  = gpio_irq;                    // GPIO bank 0 (PapaBench patch)
+     core_irq[18]  = timer_a_irq;                 // App1 tick timer (TimerA)
+     core_irq[19]  = timer_b_irq;                 // App2 tick timer (TimerB)
+     core_irq[20]  = spi_m_irq;                   // SPI master
+     core_irq[21]  = spi_s_irq;                   // SPI slave
+     core_irq[22]  = timer_d_irq;                 // TimerD (PapaBench patch)
+     core_irq[23]  = timer_e_irq;                 // TimerE (PapaBench patch)
++    core_irq[24]  = gpio1_irq;                   // GPIO bank 1 (PapaBench patch)
+   end
+ 
+   cv32e40p_top #(
+@@ -439,8 +456,10 @@
+       //@note   .irq_fast_i ({9'b0, spi_s_irq, spi_m_irq, 1'b0, (timer_a_irq | timer_b_irq), gp_i[0], uart_irq}),
+       //@note irq_fast_i[6] = TimerD (mip bit 22), irq_fast_i[7] = TimerE (mip bit 23),
+       //@note PapaBench patch.
+-    .irq_fast_i    ({7'b0, timer_e_irq, timer_d_irq, spi_s_irq, spi_m_irq,
+-                     timer_b_irq, timer_a_irq, gp_i[0], uart_irq}),
++      //@note irq_fast_i[1] = GPIO bank 0 edge interrupt, irq_fast_i[8] = GPIO bank 1
++      //@note (mip bit 24), PapaBench patch (papabench_gpio.sv).
++    .irq_fast_i    ({6'b0, gpio1_irq, timer_e_irq, timer_d_irq, spi_s_irq, spi_m_irq,
++                     timer_b_irq, timer_a_irq, gpio_irq, uart_irq}),
+     .irq_nm_i      (1'b0),
+ 
+     .scramble_key_valid_i('0),
+@@ -487,7 +506,9 @@
+     .b_rdata_o   (mem_instr_rdata)
+   );
+ 
+-  gpio #(
++  //@note PapaBench-on-Ibex patch: papabench_gpio (gpio.sv register map plus
++  //@note edge interrupts) instead of gpio, in two banks.
++  papabench_gpio #(
+     .GpiWidth ( GpiWidth ),
+     .GpoWidth ( GpoWidth )
+   ) u_gpio (
+@@ -503,7 +524,28 @@
+     .device_rdata_o (device_rdata[Gpio]),
+ 
+     .gp_i,
+-    .gp_o
++    .gp_o,
++    .irq_o          (gpio_irq)
++  );
++
++  papabench_gpio #(
++    .GpiWidth ( GpiWidth ),
++    .GpoWidth ( GpoWidth )
++  ) u_gpio1 (
++    .clk_i          (clk_sys_i),
++    .rst_ni         (rst_sys_ni),
++
++    .device_req_i   (device_req[Gpio1]),
++    .device_addr_i  (device_addr[Gpio1]),
++    .device_we_i    (device_we[Gpio1]),
++    .device_be_i    (device_be[Gpio1]),
++    .device_wdata_i (device_wdata[Gpio1]),
++    .device_rvalid_o(device_rvalid[Gpio1]),
++    .device_rdata_o (device_rdata[Gpio1]),
++
++    .gp_i           (gp1_i),
++    .gp_o           (gp1_o),
++    .irq_o          (gpio1_irq)
+   );
+ 
+   pwm_wrapper #(
