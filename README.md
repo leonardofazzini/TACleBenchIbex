@@ -136,9 +136,9 @@ From that hardware the code expects:
 
 The platform is the reference system of the `Secure-Ibex/` submodule with
 the standard Ibex core, simulated by Verilator at 50 MHz. `make sim` builds
-it from a copy of the submodule's RTL with our patches applied
-(`papabench_ibex/hw/patches/`); items marked `*` below exist only because
-of those patches.
+it directly from the submodule, checked out to its `system/papabench`
+branch (`Secure-Ibex/README.md`, `doc/Branching.md` there); items marked
+`*` below exist only on that branch, not on the reference SoC.
 
 ```mermaid
 flowchart LR
@@ -172,29 +172,30 @@ flowchart LR
 ```
 
 *Figure 2. The simulated SoC and its environment (single-MCU run). `*` =
-added by our patches. The simulation top wires the SoC's SPI master to its
-own SPI slave; the joint run uses two such SoCs (Figure 2b).*
+added on the `system/papabench` branch of Secure-Ibex. The simulation top
+wires the SoC's SPI master to its own SPI slave; the joint run uses two
+such SoCs (Figure 2b).*
 
 | Block | Address | Interrupt | Origin | Used for |
 |---|---|---|---|---|
 | RAM, 128 KiB | `0x00100000` | — | stock | code, data and stack (`papabench_ibex/link.ld`), including the AVR register array |
-| SimCtrl | `0x00020000` | — | stock (simulation only); log name from patch 0003 | results (`reference_system.log`; `fbw.log`/`autopilot.log` in the joint run) and end of run |
+| SimCtrl | `0x00020000` | — | stock (simulation only); log name, `system/papabench` branch | results (`reference_system.log`; `fbw.log`/`autopilot.log` in the joint run) and end of run |
 | Machine timer | `0x80000000` | IRQ 7 | stock | scheduler tick of both programs; time base of the peripheral models |
 | UART | `0x80001000` | IRQ 16 (RX not empty) | stock | Autopilot: GPS receiver |
-| GPIO bank 0 | `0x80002000` | IRQ 17 (edge on `gp_i[0]`) | stock address; edge interrupts from patch 0003 | FBW: radio PPM, 4017 clock/reset; see below |
-| PWM | `0x80003000` | — | stock; 20-bit counter from patch 0001 | FBW: servos, channels 0–9 |
+| GPIO bank 0 | `0x80002000` | IRQ 17 (edge on `gp_i[0]`) | stock address; edge interrupts, `system/papabench` branch | FBW: radio PPM, 4017 clock/reset; see below |
+| PWM | `0x80003000` | — | stock; 20-bit counter, `system/papabench` branch | FBW: servos, channels 0–9 |
 | SPI master | `0x80004000` | IRQ 20 (byte received) | stock | Autopilot: its end of the SPI link (also the virtual Autopilot's, in a FBW-only run) |
 | SPI slave | `0x80005000` | IRQ 21 (byte received, frame done) | stock | FBW: its end of the SPI link (also the virtual FBW's, in an Autopilot-only run) |
 | TimerA | `0x80010000` | IRQ 18 | stock | FBW: servo pulse timing (AVR Timer1 compare) |
 | TimerB | `0x80020000` | IRQ 19 | stock | both: ADC conversion complete |
-| TimerD | `0x80040000` | IRQ 22 | patch 0002 | Autopilot: SPI byte pacing (AVR Timer1 compare; also the virtual Autopilot's) |
-| TimerE | `0x80050000` | IRQ 23 | patch 0002 | FBW: UART transmit complete |
-| GPIO bank 1 | `0x80060000` | IRQ 24 (edge on `gp_i[0]`) | patch 0003 | Autopilot: modem clock, modem data bit; see below |
+| TimerD | `0x80040000` | IRQ 22 | `system/papabench` branch | Autopilot: SPI byte pacing (AVR Timer1 compare; also the virtual Autopilot's) |
+| TimerE | `0x80050000` | IRQ 23 | `system/papabench` branch | FBW: UART transmit complete |
+| GPIO bank 1 | `0x80060000` | IRQ 24 (edge on `gp_i[0]`) | `system/papabench` branch | Autopilot: modem clock, modem data bit; see below |
 
 Each program has its own GPIO bank and never touches the other one, so
 the two programs share no GPIO register (they are meant to be virtualised
 on one core later). Both banks are the stock GPIO register map plus edge
-interrupts (`papabench_ibex/hw/rtl/papabench_gpio.sv`): a falling edge on
+interrupts (`gpio_irq.sv` on the `system/papabench` branch): a falling edge on
 `gp_i[0]` sets a status bit, the bank's interrupt line stays high until the
 handler writes 1 to clear it. In each bank `gp_o[0]` enables the program's
 stimuli and `gp_o[7]` tells the joint simulation that the program has
@@ -236,7 +237,7 @@ flowchart LR
   acore -.-> alog[("autopilot.log")]
 ```
 
-*Figure 2b. The two-MCU simulation top (`papabench_ibex/hw/rtl/papabench_dual.sv`).*
+*Figure 2b. The two-MCU simulation top (`papabench_dual.sv`, `system/papabench` branch).*
 
 The Autopilot's SPI master drives the FBW's SPI slave; the other two SPI
 ends are unused. One environment serves both, as in the single-MCU run: it
@@ -688,9 +689,10 @@ Run from `papabench_ibex/`:
 | `make PROG=<prog> run` | Single-MCU run: build, simulate and print `build/<prog>/reference_system.log` |
 | `make run-joint` | Joint run: build both programs with `JOINT=1` (`build/<prog>-joint/`) and run them together on the two-MCU simulator; prints `build/joint/fbw.log` and `build/joint/autopilot.log` |
 | `make PROG=<prog> MEASURE=0 run`, `make MEASURE=0 run-joint` | Same scenario with no measurement at all (no instrumentation hooks, no calibration, no timing): the program just runs for `TICKS` ticks. Built in `build/<prog>[-joint]-nomeasure/`; the output is the header line, the `link` lines and `END`, the servo pulses are in `pwm.log` |
-| `make sim` | (Re)build the single-MCU Verilator model from `Secure-Ibex/` + `hw/patches/` (FuseSoC target `sim_ibex`) into `build/sim/` |
-| `make sim-dual` | (Re)build the two-MCU Verilator model (`hw/rtl/papabench_dual.sv`, same staged and patched SoC) into `build/sim-dual/` |
-| `make hwtest` | Smoke test of the SoC patches (TimerD/E on IRQ 22/23, GPIO banks with edge interrupts on IRQ 17/24, SPI loopback, 20-bit PWM, `pwm.log`) on the single-MCU simulator |
+| `make sim` | (Re)build the single-MCU Verilator model directly from `Secure-Ibex/`, checked out to `system/papabench` (FuseSoC target `sim_ibex`) into `build/sim/` |
+| `make sim-dual` | (Re)build the two-MCU Verilator model (`papabench_dual.sv`, `system/papabench` branch) into `build/sim-dual/` |
+| `make checkout-branch` | Switch the `Secure-Ibex` submodule to `system/papabench` (`sim`/`sim-dual` refuse to build otherwise) |
+| `make hwtest` | Smoke test of the `system/papabench` SoC additions (TimerD/E on IRQ 22/23, GPIO banks with edge interrupts on IRQ 17/24, SPI loopback, 20-bit PWM, `pwm.log`) on the single-MCU simulator |
 | `make PROG=<prog> disassemble` | Write `build/<prog>/<prog>.dis` |
 | `make PROG=<prog> vmem` | Write a `.vmem` image (not needed by Verilator) |
 | `make PROG=<prog> clean` | Remove `build/<prog>/` |
@@ -982,41 +984,42 @@ models forward the written bytes to the SPI (section 8).
 ### 5. Simulator from the submodule, with our SoC patches
 
 `make sim` builds the standard-Ibex Verilator model (FuseSoC target
-`sim_ibex`) from the `Secure-Ibex/` sources. It uses FuseSoC's
+`sim_ibex`) directly from the `Secure-Ibex/` sources. It uses FuseSoC's
 `--build-root`, so the output goes to `papabench_ibex/build/sim/` and the
 submodule stays clean.
 
-The SoC hardware is extended without touching the submodule:
+The SoC hardware PapaBench needs beyond the reference SoC lives on
+`Secure-Ibex`'s own `system/papabench` branch, not as local patches: that
+repository is branch-friendly (`Secure-Ibex/doc/Branching.md`), one
+`system/<name>` branch per SoC, merging `master` for core updates.
+`papabench_ibex/`'s `make sim`/`make sim-dual` refuse to build unless the
+submodule is checked out to `system/papabench` (`make checkout-branch`
+switches it), then run FuseSoC on that branch's own cores —
+`riscv:soc:reference_system` (one MCU, `make sim`) or
+`riscv:soc:papabench_dual` (two MCUs, `make sim-dual`, into
+`build/sim-dual/`) — with no local staging or patching. Everything else
+(Ibex, bus, RAM, timers, SPI, DPI) is the reference SoC, unchanged on that
+branch too.
 
-1. `make sim` copies the SoC wrapper, its peripherals, the simulation top and
-   the Verilator testbench from `Secure-Ibex/` into `build/sim/hw/`.
-2. It applies `papabench_ibex/hw/patches/*.patch` there, in name order. A
-   patch that no longer applies (for example after a submodule update)
-   stops the build.
-3. It builds our cores from that copy: `papabench:soc:reference_system`
-   (one MCU, `make sim`) or `papabench:soc:dual` (two MCUs, `make
-   sim-dual`, into `build/sim-dual/`), both on
-   `papabench:soc:reference_system_core` (`papabench_ibex/hw/*.core`).
-   Everything else (Ibex, bus, RAM, timers, SPI, DPI) comes unmodified from
-   the submodule's cores.
+What that branch adds, all on top of the reference SoC (see
+`Secure-Ibex/README.md` and `Secure-Ibex/rtl/system/README.md` there):
 
-Current patches:
-
-| Patch | Change |
+| Addition | Change |
 |---|---|
-| `0001-soc-pwm-ctr-size.patch` | PWM counter width becomes a parameter (default 8, as before); the simulation top sets 20 bits, enough for a 20 ms servo period at 50 MHz |
-| `0002-soc-timers-d-e.patch` | TimerD at `0x80040000` (fast IRQ 22) and TimerE at `0x80050000` (fast IRQ 23), same `timer.sv`. They give every function its own timer (section 6) |
-| `0003-soc-gpio-banks.patch` | Two GPIO banks, one per program, so that the two programs share no GPIO register: bank 0 at the stock address (IRQ 17) and bank 1 at `0x80060000` (IRQ 24, new ports `gp1_i`/`gp1_o`). Both are our `papabench_ibex/hw/rtl/papabench_gpio.sv`: the stock GPIO registers plus edge interrupts (enable, status with write-1-to-clear, falling/rising edge select) |
-| `0004-soc-simctrl-log-name.patch` | The SimCtrl log file name becomes a parameter (default `reference_system.log`, as before), so the two MCUs of the joint run write their own |
-| `0005-sim-top-papabench-env.patch` | The simulation top instantiates our environment, `papabench_ibex/hw/rtl/papabench_env.sv`, which drives the inputs of both GPIO banks and the UART RX line (section 6); the SPI master → slave loopback stays |
-| `0006-sim-top-pwm-monitor.patch` | The simulation top instantiates `papabench_ibex/hw/rtl/papabench_pwm_monitor.sv`, which logs every PWM pulse to `pwm.log` (the PWM cannot be read back) |
+| 20-bit PWM | PWM counter width becomes a parameter (default 8, as on the reference SoC); the simulation top sets 20 bits, enough for a 20 ms servo period at 50 MHz |
+| TimerD / TimerE | TimerD at `0x80040000` (fast IRQ 22) and TimerE at `0x80050000` (fast IRQ 23), same `timer.sv`. They give every function its own timer (section 6) |
+| Two GPIO banks | So that the two programs share no GPIO register: bank 0 at the stock address (IRQ 17) and bank 1 at `0x80060000` (IRQ 24, new ports `gp1_i`/`gp1_o`). Both are `gpio_irq.sv`: the stock GPIO registers plus edge interrupts (enable, status with write-1-to-clear, falling/rising edge select) |
+| `SimCtrlLogName` | The SimCtrl log file name becomes a parameter (default `reference_system.log`, as before), so the two MCUs of the joint run write their own |
+| Simulation environment | The simulation top instantiates `papabench_env.sv`, which drives the inputs of both GPIO banks and the UART RX line (section 6); the SPI master → slave loopback stays |
+| PWM monitor | The simulation top instantiates `papabench_pwm_monitor.sv`, which logs every PWM pulse to `pwm.log` (the PWM cannot be read back) |
 
-The two-MCU top, `papabench_ibex/hw/rtl/papabench_dual.sv`, and its
-Verilator testbench, `papabench_ibex/hw/dv/papabench_dual.cc`, are our own
-files (section 8).
+The two-MCU top, `papabench_dual.sv`, and its Verilator testbench,
+`dv/papabench/papabench_dual.cc`, are also committed on that branch
+(section 8).
 
-`make hwtest` checks the patches: TimerD and TimerE each raise exactly
-their periodic interrupts on their own line (IRQ 22, 23), never before the
+`make hwtest` checks these additions (`Secure-Ibex/sw/System_papabench/
+hw_smoke/`): TimerD and TimerE each raise exactly their periodic
+interrupts on their own line (IRQ 22, 23), never before the
 compare time, and no other line (17–24) fires; the two GPIO banks' outputs
 are independent; with the Autopilot environment enabled (bank 1), the modem
 clock raises IRQ 24 once per edge (acknowledged by writing 1 to the bank's
@@ -1069,8 +1072,9 @@ SoC](#how-the-avr-world-is-mapped-onto-the-soc). Implementation details:
   so the model's own cycles do not count as AVR time.
 - **The SPI link and the other microcontroller**: see section 8.
 - **Simulation environment.** `papabench_env.sv` sits in the Verilator top
-  and plays, from the clock only, the tables generated by
-  `hw/stimulus/gen_stimulus.py`:
+  (on the `system/papabench` branch of Secure-Ibex) and plays, from the
+  clock only, the tables generated by `gen_papabench_stim.py`, also
+  committed there:
   - FBW: the radio PPM train, 9 channels every 25 ms, mode MANUAL → AUTO1 →
     AUTO2, roll stick sweeping;
   - Autopilot: the modem clock (4800 Hz), and GPS UBX bursts (NAV-POSUTM,
@@ -1130,9 +1134,10 @@ long run (`TICKS=600`, about 10 s) does.
 
 To change the scenario:
 
-- radio and GPS: edit `papabench_ibex/hw/stimulus/gen_stimulus.py`, then
-  run `make sim` and `make sim-dual` (the tables are compiled into the
-  simulators);
+- radio and GPS: edit `gen_papabench_stim.py` on the Secure-Ibex
+  `system/papabench` branch, run it and commit the regenerated
+  `papabench_stim.svh`, then run `make sim` and `make sim-dual` here (the
+  tables are compiled into the simulators);
 - the virtual microcontroller's frames (single-MCU runs) and the ADC
   values: edit `ap_spi_frame()`, `fbw_spi_frame()`, `ap_adc_sample()` or
   `fbw_adc_sample()` in `papabench_ibex/harness/`, then rebuild the program.
@@ -1292,7 +1297,7 @@ Repository layout
 | `papabench_ibex/link.ld` | Linker script (whole 128 KiB RAM) |
 | `papabench_ibex/harness/calib.c` | Empty instrumented function for the overhead |
 | `papabench_ibex/patches/` | Upstream bug fixes applied to build copies |
-| `papabench_ibex/hw/` | SoC hardware patches, our FuseSoC cores, GPIO bank with edge interrupts, simulation environment, PWM monitor and two-MCU top (`rtl/`), two-MCU testbench (`dv/`), stimulus generator (`stimulus/`), `hwtest` smoke test |
+| `Secure-Ibex/` on `system/papabench` | SoC additions beyond the reference SoC: TimerD/E, GPIO bank with edge interrupts, `system/papabench`'s own FuseSoC cores, simulation environment, PWM monitor and two-MCU top, two-MCU testbench, stimulus generator, `hwtest` smoke test — see `Secure-Ibex/README.md` |
 | `papabench_ibex/scripts/decode_pwm.py` | Host decoder of `pwm.log` into servo widths |
 | `bench/parallel/PapaBench/` | Upstream PapaBench (read-only) |
 | `Secure-Ibex/` | Ibex SoC submodule |
