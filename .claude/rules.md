@@ -64,6 +64,16 @@ The same row after the user corrected it:
 - If a reference file and the code disagree, the code wins; fix the reference file.
 - A new subsystem big enough for its own file also gets a routing row in `CLAUDE.md` and a line in `tree.md`.
 
+## Compaction policy
+
+`status.md` is the live index, not an unlimited transcript. When it reaches 5,000 tokens (about 20 KiB of Markdown),
+copy completed task sections older than the three newest tasks, unchanged, to
+`.claude/status-history.md` and replace them in `status.md` with a dated compact index
+(task/date, outcome, open decision, and a link to the archive). Keep the newest three
+task sections, every open task, and `To-do` at their original size. Never compact the
+current task or an entry containing a user correction. The archive is append-only and
+the compaction itself gets one status row.
+
 ## What not to do
 
 - Do not rewrite history or tidy old tasks in `status.md`.

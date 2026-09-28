@@ -15,6 +15,7 @@ Not listed: build outputs (`*.o`, `*.d`, `*.elf`, `*.bin`, `*.vmem`, `*.dis`, `a
 - `.claude/rules.md`: protocol for updating `tree.md`, `status.md` and reference files.
 - `.claude/tree.md`: this map.
 - `.claude/status.md`: per-task log, to-do list, completed history.
+- `.claude/status-history.md`: append-only verbatim archive of entries removed from the live log during compaction.
 - `.claude/reference/papabench.md`: PapaBench structure, tasks, macros, AVR register layer, float math.
 - `.claude/reference/ibex-platform.md`: what we use from Secure-Ibex — memory map, `common/` lib, crt0, link.ld, Verilator flow, `mcycle`.
 - `.claude/reference/port-harness.md`: design of the PapaBench-on-Ibex port — SFR remap, timer emulation, per-task measurement, open decisions.
